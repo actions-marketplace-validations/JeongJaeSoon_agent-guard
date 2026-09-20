@@ -24,6 +24,9 @@ REAL_DIRNAME=$(command -v dirname)
 REAL_PWD=$(command -v pwd)
 PATH="$MOCK_BIN:$PATH"
 export PATH
+# Keep the large deterministic suite out of the developer's support logs.
+# Dedicated audit tests explicitly turn logging on in private temp storage.
+export AGENT_GUARD_LOG_MODE=off
 export AGENT_GUARD_GITLEAKS_CONFIG="$PLUGIN_ROOT/config/gitleaks.toml"
 
 # Isolate git from the developer's global config so inherited values like
@@ -90,6 +93,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$MOCK_BIN"
+# The runtime intentionally prefers its private install over PATH. Keep the
+# suite hermetic so a developer's real private gitleaks cannot shadow the PATH
+# fixture used by tests that do not set an explicit scanner.
+DEFAULT_PRIVATE_GITLEAKS_DIR="$TMP_ROOT/private-gitleaks-empty"
+mkdir -p "$DEFAULT_PRIVATE_GITLEAKS_DIR"
+export AGENT_GUARD_GITLEAKS_BIN_DIR="$DEFAULT_PRIVATE_GITLEAKS_DIR"
 
 if [ ! -e "$PLUGIN_ROOT/commands/setup-shell.md" ]; then
   ok "setup-shell has a single skill implementation"
@@ -98,8 +107,10 @@ else
 fi
 
 setup_shell_skill="$PLUGIN_ROOT/skills/setup-shell/SKILL.md"
-setup_shell_metadata="$PLUGIN_ROOT/skills/setup-shell/agents/openai.yaml"
+codex_setup_shell_skill="$PLUGIN_ROOT/codex-skills/setup-shell/SKILL.md"
+setup_shell_metadata="$PLUGIN_ROOT/codex-skills/setup-shell/agents/openai.yaml"
 if grep -Fq '../../bin/agent-guard' "$setup_shell_skill" \
+  && grep -Fq '../../skills/setup-shell/SKILL.md' "$codex_setup_shell_skill" \
   && grep -Fq 'Obtain host approval' "$setup_shell_skill" \
   && grep -Fq 'is separate from plugin' "$setup_shell_skill" \
   && grep -Fq 'Do not retry the same blocked write' "$setup_shell_skill" \
@@ -122,6 +133,8 @@ for file in \
   "$ROOT/scripts/build-release-tarball.sh" \
   "$ROOT/githooks/pre-commit" \
   "$PLUGIN_ROOT/scripts/gitleaks-checksum.sh" \
+  "$ROOT/tests/hook-outcome-contract.sh" \
+  "$ROOT/tests/gitleaks-resolution.sh" \
   "$ROOT/tests/run.sh"; do
   run_expect 0 "shell syntax: $file" sh -n "$file"
 done
@@ -147,6 +160,13 @@ fi
 # while AGENT_GUARD_COMMAND_WRAPPING=off is a persistent install-time opt-out.
 # Stub only the release downloads; archive verification, extraction, linking,
 # setup-shell, and rc generation all run through the real implementation.
+run_expect 0 "private metadata-only audit logging contract" sh "$ROOT/tests/audit-log.sh"
+run_expect 0 "host plugin lifecycle delegates safely" sh "$ROOT/tests/plugin-management.sh"
+
+run_expect 0 "standalone update preserves executable and link destinations" \
+  sh "$ROOT/tests/bootstrap-update.sh"
+run_expect 0 "release archive carries README-linked Markdown guides" \
+  sh "$ROOT/tests/release-docs.sh"
 bootstrap_fixture="$TESTTMP/bootstrap-fixture"
 mkdir -p "$bootstrap_fixture/bin"
 "$ROOT/scripts/build-release-tarball.sh" 2.0.0 "$bootstrap_fixture/agent-guard-2.0.0.tar.gz"
@@ -228,17 +248,167 @@ else
   not_ok "release automation preserves the v1 moving tag when publishing v2+"
 fi
 
-if jq -e '.hooks == "./hooks.json" and .skills == "./skills/"' "$PLUGIN_ROOT/.codex-plugin/plugin.json" >/dev/null; then
+if grep -Fq 'publish_ready=true' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'publishing v${v} requires a second dispatch with version=${v} explicitly set' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq "if: \${{ steps.state.outputs.publish_ready == 'true' && !inputs.dry_run }}" "$ROOT/.github/workflows/release.yml" \
+   && ! grep -Fq 'gh pr merge' "$ROOT/.github/workflows/release.yml" \
+   && ! grep -Fq 'Wait for PR to merge' "$ROOT/.github/workflows/release.yml"; then
+  ok "release automation separates reviewed PR merge from explicit publish dispatch"
+else
+  not_ok "release automation separates reviewed PR merge from explicit publish dispatch"
+fi
+
+main_gate_line=$(grep -n 'name: Require an exact main dispatch' "$ROOT/.github/workflows/release.yml" | cut -d: -f1)
+version_compute_line=$(grep -n 'name: Compute next version' "$ROOT/.github/workflows/release.yml" | cut -d: -f1)
+if [ -n "$main_gate_line" ] \
+   && [ -n "$version_compute_line" ] \
+   && [ "$main_gate_line" -lt "$version_compute_line" ] \
+   && grep -Fq 'if [ "$DISPATCH_REF" != "refs/heads/main" ]' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'if [ "$checkout_sha" != "$main_sha" ]' "$ROOT/.github/workflows/release.yml"; then
+  ok "release workflow refuses feature refs and stale main checkouts before writes"
+else
+  not_ok "release workflow refuses feature refs and stale main checkouts before writes"
+fi
+
+if grep -Fq "grep -E '^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$'" "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq "grep -qE '^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$'" "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'must be greater than latest strict semver tag' "$ROOT/.github/workflows/release.yml" \
+   && ! grep -Fq 'v="${{ steps.ver.outputs.version }}"' "$ROOT/.github/workflows/release.yml" \
+   && ! grep -Fq 'br="${{ steps.ver.outputs.branch }}"' "$ROOT/.github/workflows/release.yml" \
+   && ! grep -Fq 'maj="${{ steps.ver.outputs.major }}"' "$ROOT/.github/workflows/release.yml" \
+   && ! grep -Fq '"${{ steps.ver.outputs.previous }}" \' "$ROOT/.github/workflows/release.yml"; then
+  ok "release version derivation rejects non-semver tags and keeps outputs out of run scripts"
+else
+  not_ok "release version derivation rejects non-semver tags and keeps outputs out of run scripts"
+fi
+
+if grep -Fq 'gh pr list \' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq -- '--state merged \' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq -- '--head "$release_branch" \' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'if [ "$release_sha" != "$main_sha" ]' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'if [ -z "$expected_release_sha" ] || [ "$head_sha" != "$expected_release_sha" ]' "$ROOT/.github/workflows/release.yml"; then
+  ok "release publish stays pinned to the reviewed release PR merge commit"
+else
+  not_ok "release publish stays pinned to the reviewed release PR merge commit"
+fi
+
+if grep -Fq -- '--json headRefOid,mergeCommit' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'checks: read' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq "required_checks=\$'Agent Guard\\nTest (ubuntu-latest)\\nTest (macos-latest)\\nLint\\nPlugin Layout\\nHOL Plugin Scanner'" "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'commits/${release_head_sha}/check-runs?filter=latest&per_page=100' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'if [ "$check_result" != "success" ]' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'release_head_sha=$release_head_sha' "$ROOT/.github/workflows/release.yml"; then
+  ok "release publish requires every mandatory check on the exact reviewed PR head"
+else
+  not_ok "release publish requires every mandatory check on the exact reviewed PR head"
+fi
+
+if grep -Fq 'commits/${release_sha}/check-runs?filter=latest&per_page=100' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'sort_by(.id)' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'required main check' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'if [ "$check_result" != "success" ]' "$ROOT/.github/workflows/release.yml"; then
+  ok "release publish requires mandatory main checks on the exact merge commit"
+else
+  not_ok "release publish requires mandatory main checks on the exact merge commit"
+fi
+
+if grep -Fq 'remote_tree=$(git rev-parse' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'if [ "$remote_tree" != "$local_tree" ]' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'gh pr list --state open --base main --head "$br" --json url' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'gh pr edit "$url"' "$ROOT/.github/workflows/release.yml"; then
+  ok "release PR creation safely reuses only an identical remote release tree"
+else
+  not_ok "release PR creation safely reuses only an identical remote release tree"
+fi
+
+release_validation_line=$(grep -n 'name: Validate release candidate before opening PR' "$ROOT/.github/workflows/release.yml" | cut -d: -f1)
+release_pr_line=$(grep -n 'name: Open release PR' "$ROOT/.github/workflows/release.yml" | cut -d: -f1)
+if [ -n "$release_validation_line" ] \
+   && [ -n "$release_pr_line" ] \
+   && [ "$release_validation_line" -lt "$release_pr_line" ] \
+   && grep -Fq '/bin/dash tests/run.sh' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'scripts/validate-plugin-layout.sh --all' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'scripts/validate-submission-readiness.sh' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'plugins/agent-guard/bin/agent-guard smoke-test' "$ROOT/.github/workflows/release.yml"; then
+  ok "release candidate is verified before the bot opens its PR"
+else
+  not_ok "release candidate is verified before the bot opens its PR"
+fi
+
+if grep -Fq 'cli_version=$(sed -n' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'claude_version=$(jq -r' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'codex_version=$(jq -r' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'catalog_version=$(jq -r' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'scripts/validate-plugin-layout.sh --marketplace' "$ROOT/.github/workflows/release.yml"; then
+  ok "release publish rechecks CLI, manifest, and catalog version alignment"
+else
+  not_ok "release publish rechecks CLI, manifest, and catalog version alignment"
+fi
+
+if grep -Fq '이 PR은 자동 병합되지 않으며' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'git commit --allow-empty -m "ci: trigger release verification"' "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq 'Agent Guard, Test (ubuntu-latest), Test (macos-latest), Lint, Plugin Layout, HOL Plugin Scanner' "$ROOT/.github/workflows/release.yml"; then
+  ok "release PR explains the manual review and second-dispatch handoff"
+else
+  not_ok "release PR explains the manual review and second-dispatch handoff"
+fi
+
+if jq -e '.hooks == "./hooks.json" and .skills == "./codex-skills/"' "$PLUGIN_ROOT/.codex-plugin/plugin.json" >/dev/null; then
   ok "Codex plugin manifest explicitly declares hook and skill paths"
 else
   not_ok "Codex plugin manifest explicitly declares hook and skill paths"
+fi
+
+if "$ROOT/scripts/validate-plugin-layout.sh" --codex >"$OUT" 2>"$ERR" \
+   && "$ROOT/scripts/validate-plugin-layout.sh" --claude >"$OUT" 2>"$ERR"; then
+  ok "host-specific setup-skill metadata passes both plugin layouts"
+else
+  not_ok "host-specific setup-skill metadata passes both plugin layouts"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+layout_fixture_root="$TESTTMP/layout-frontmatter"
+mkdir -p "$layout_fixture_root/scripts" "$layout_fixture_root/plugins"
+cp "$ROOT/scripts/validate-plugin-layout.sh" "$layout_fixture_root/scripts/"
+cp -R "$PLUGIN_ROOT" "$layout_fixture_root/plugins/agent-guard"
+layout_fixture_skill="$layout_fixture_root/plugins/agent-guard/codex-skills/setup-agent-guard/SKILL.md"
+sed '3a\
+unexpected: value' "$layout_fixture_skill" >"$layout_fixture_skill.tmp"
+mv "$layout_fixture_skill.tmp" "$layout_fixture_skill"
+if "$layout_fixture_root/scripts/validate-plugin-layout.sh" --codex >"$OUT" 2>"$ERR"; then
+  not_ok "Codex plugin layout rejects arbitrary setup-skill frontmatter"
+else
+  ok "Codex plugin layout rejects arbitrary setup-skill frontmatter"
+fi
+
+cp -R "$PLUGIN_ROOT" "$layout_fixture_root/plugins/agent-guard-false"
+mv "$layout_fixture_root/plugins/agent-guard-false" "$layout_fixture_root/plugins/agent-guard-replacement"
+mv "$layout_fixture_root/plugins/agent-guard" "$layout_fixture_root/plugins/agent-guard-original"
+mv "$layout_fixture_root/plugins/agent-guard-replacement" "$layout_fixture_root/plugins/agent-guard"
+layout_fixture_skill="$layout_fixture_root/plugins/agent-guard/codex-skills/setup-agent-guard/SKILL.md"
+sed '3a\
+disable-model-invocation: true' "$layout_fixture_skill" >"$layout_fixture_skill.tmp"
+mv "$layout_fixture_skill.tmp" "$layout_fixture_skill"
+if "$layout_fixture_root/scripts/validate-plugin-layout.sh" --codex >"$OUT" 2>"$ERR"; then
+  not_ok "Codex plugin layout rejects Claude-only invocation metadata"
+else
+  ok "Codex plugin layout rejects Claude-only invocation metadata"
 fi
 
 # Guided setup must verify the installed plugin itself and select the active
 # host's live hook boundary. A standalone PATH binary or a passing binary smoke
 # test is not proof that plugin hooks are trusted or dispatched by either host.
 setup_skill="$PLUGIN_ROOT/skills/setup-agent-guard/SKILL.md"
-if grep -Fq '../../bin/agent-guard' "$setup_skill" \
+codex_setup_skill="$PLUGIN_ROOT/codex-skills/setup-agent-guard/SKILL.md"
+setup_skill_openai_metadata="$PLUGIN_ROOT/codex-skills/setup-agent-guard/agents/openai.yaml"
+if grep -Fxq 'disable-model-invocation: true' "$setup_skill" \
+   && ! grep -Fq 'disable-model-invocation:' "$codex_setup_skill" \
+   && grep -Fq '../../skills/setup-agent-guard/SKILL.md' "$codex_setup_skill" \
+   && jq -e 'has("skills") | not' "$PLUGIN_ROOT/.claude-plugin/plugin.json" >/dev/null \
+   && grep -Fxq '  allow_implicit_invocation: false' "$setup_skill_openai_metadata" \
+   && grep -Fq 'default_prompt: "Use $setup-agent-guard' "$setup_skill_openai_metadata" \
+   && grep -Fq '../../bin/agent-guard' "$setup_skill" \
    && grep -Fq 'Compare its `version` with the plugin binary' "$setup_skill" \
    && grep -Fq 'Identify the active host' "$setup_skill" \
    && grep -Fq 'Settings > Hooks' "$setup_skill" \
@@ -253,32 +423,123 @@ if grep -Fq '../../bin/agent-guard' "$setup_skill" \
    && grep -Fq 'blocked by the host sandbox' "$setup_skill" \
    && grep -Fq 'Do not retry the same blocked write' "$setup_skill" \
    && grep -Fq 'run in a separate terminal' "$setup_skill" \
+   && grep -Fq 'gitleaks version isolation requires' "$setup_skill" \
+   && grep -Fq '`util-linux`' "$setup_skill" \
+   && grep -Fq 'gitleaks를 다시 설치하지 마세요' "$setup_skill" \
    && grep -Fq 'rerun the read-only' "$setup_skill" \
    && grep -Fq 'They do not prove that the host is dispatching plugin hooks' "$setup_skill"; then
-  ok "shared setup skill selects host-specific trust and live-hook layers"
+  ok "Claude explicit-only and Codex explicit-policy setup entries share canonical host guidance"
 else
-  not_ok "shared setup skill selects host-specific trust and live-hook layers"
+  not_ok "Claude explicit-only and Codex explicit-policy setup entries share canonical host guidance"
 fi
 
-for event in PreToolUse PostToolUse Stop UserPromptSubmit; do
-  claude_canonical=$(jq -r ".hooks.${event}[0].matcher" "$PLUGIN_ROOT/hooks/hooks.json")
-  codex_canonical=$(jq -r ".hooks.${event}[0].matcher" "$PLUGIN_ROOT/hooks.json")
-  claude_example=$(jq -r ".hooks.${event}[0].matcher" "$ROOT/examples/claude/settings.project.json")
-  codex_example=$(jq -r ".hooks.${event}[0].matcher" "$ROOT/examples/codex/hooks.json")
-  [ "$claude_example" = "$claude_canonical" ] \
-    && ok "$event matcher in Claude example matches Claude plugin hooks" \
-    || not_ok "$event matcher in Claude example matches Claude plugin hooks (got: $claude_example)"
-  [ "$codex_example" = "$codex_canonical" ] \
-    && ok "$event matcher in Codex example matches Codex plugin hooks" \
-    || not_ok "$event matcher in Codex example matches Codex plugin hooks (got: $codex_example)"
+# The standalone examples no longer need per-field parity assertions here: they
+# are rendered from the same matcher tables as the plugin manifests, and the
+# render-hook-manifests.sh --check assertion below fails on any drift in all
+# four files at once.
+
+expected_codex_pre='Bash|apply_patch|Agent|Task|mcp__.*'
+expected_codex_post='Bash|apply_patch|Agent|Task|mcp__.*'
+expected_claude_pre='Write|Edit|MultiEdit|NotebookEdit|Read|NotebookRead|Grep|Glob|Bash|WebFetch|WebSearch|apply_patch|Agent|Task|mcp__.*'
+expected_claude_post='^(Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|apply_patch|Read|NotebookRead|Grep|Glob|WebFetch|WebSearch|Agent|Task|Skill|Monitor|LSP|ListMcpResourcesTool|ReadMcpResourceTool|mcp__.*)$'
+
+assert_manifest_matchers() {
+  matcher_file=$1
+  matcher_label=$2
+  expected_pre=$3
+  expected_post=$4
+  actual_pre=$(jq -r '.hooks.PreToolUse[0].matcher' "$matcher_file")
+  actual_post=$(jq -r '.hooks.PostToolUse[0].matcher' "$matcher_file")
+  if [ "$actual_pre" = "$expected_pre" ]; then
+    ok "$matcher_label PreToolUse matcher equals the renderer contract"
+  else
+    not_ok "$matcher_label PreToolUse matcher drifted (got: $actual_pre)"
+  fi
+  if [ "$actual_post" = "$expected_post" ]; then
+    ok "$matcher_label PostToolUse matcher equals the renderer contract"
+  else
+    not_ok "$matcher_label PostToolUse matcher drifted (got: $actual_post)"
+  fi
+}
+
+assert_manifest_matchers "$PLUGIN_ROOT/hooks.json" "Codex plugin" \
+  "$expected_codex_pre" "$expected_codex_post"
+assert_manifest_matchers "$ROOT/examples/codex/hooks.json" "Codex example" \
+  "$expected_codex_pre" "$expected_codex_post"
+assert_manifest_matchers "$PLUGIN_ROOT/hooks/hooks.json" "Claude plugin" \
+  "$expected_claude_pre" "$expected_claude_post"
+assert_manifest_matchers "$ROOT/examples/claude/settings.project.json" "Claude example" \
+  "$expected_claude_pre" "$expected_claude_post"
+
+claude_post_matcher=$(jq -r '.hooks.PostToolUse[0].matcher' "$PLUGIN_ROOT/hooks/hooks.json")
+for structural_tool in \
+  PowerShell Skill Monitor LSP ListMcpResourcesTool \
+  ReadMcpResourceTool mcp__server__tool; do
+  if jq -n -e --arg matcher "$claude_post_matcher" --arg tool "$structural_tool" \
+      '$tool | test($matcher)' >/dev/null; then
+    ok "Claude PostToolUse matcher structurally covers $structural_tool"
+  else
+    not_ok "Claude PostToolUse matcher structural approximation misses $structural_tool"
+  fi
+done
+for structural_unknown in \
+  FutureTool SkillManager MonitorStatus MyLSPClient TodoWrite \
+  NotASkill xReadMcpResourceTool Bashful; do
+  if jq -n -e --arg matcher "$claude_post_matcher" --arg tool "$structural_unknown" \
+      '$tool | test($matcher) | not' >/dev/null; then
+    ok "Claude PostToolUse matcher structural approximation passes through unrelated $structural_unknown"
+  else
+    not_ok "Claude PostToolUse matcher structural approximation overmatches unrelated $structural_unknown"
+  fi
+done
+
+if command -v node >/dev/null 2>&1; then
+  if node -e '
+      const pattern = new RegExp(process.argv[1]);
+      const positives = process.argv[2].split(",");
+      const negatives = process.argv[3].split(",");
+      if (!positives.every((name) => pattern.test(name))) process.exit(1);
+      if (!negatives.every((name) => !pattern.test(name))) process.exit(1);
+    ' "$claude_post_matcher" \
+      'PowerShell,Skill,Monitor,LSP,ListMcpResourcesTool,ReadMcpResourceTool,mcp__server__tool' \
+      'FutureTool,SkillManager,MonitorStatus,MyLSPClient,TodoWrite,NotASkill,xReadMcpResourceTool,Bashful'; then
+    ok "Claude PostToolUse matcher passes the actual JavaScript RegExp contract"
+  else
+    not_ok "Claude PostToolUse matcher failed the JavaScript RegExp contract"
+  fi
+else
+  ok "Claude PostToolUse JavaScript RegExp check skipped without Node; structural checks remain active"
+fi
+
+# Delegating work is a parent-context boundary. Both current `Agent` calls and
+# Claude's legacy `Task` alias must enter the pre/post pipeline on both hosts;
+# otherwise a secret can leave in the delegation prompt or return unredacted in
+# the subagent result even though the subagent's own tool calls are protected.
+for manifest_file in \
+  "$PLUGIN_ROOT/hooks.json" \
+  "$PLUGIN_ROOT/hooks/hooks.json"; do
+  for event in PreToolUse PostToolUse; do
+    matcher=$(jq -r ".hooks.${event}[0].matcher" "$manifest_file")
+    case "|$matcher|" in
+      *'|Agent|'*|*'|Agent|Task|'*)
+        case "|$matcher|" in
+          *'|Task|'*|*'|Task|mcp__.*|'*)
+            ok "$event matcher covers Agent and legacy Task in $manifest_file" ;;
+          *) not_ok "$event matcher covers legacy Task in $manifest_file (got: $matcher)" ;;
+        esac
+        ;;
+      *) not_ok "$event matcher covers Agent in $manifest_file (got: $matcher)" ;;
+    esac
+  done
 done
 
 # Full hook-object parity: type, timeout, and the trailing hook-* subcommand
-# must agree across all four manifests. Command STRINGS legitimately differ by
-# host (CLAUDE_PLUGIN_ROOT vs PLUGIN_ROOT vs relative/absolute paths), so only
-# the stable trailing subcommand token is compared, not the whole command. This
-# catches a copy-paste swap (e.g. Stop wired to hook-post-tool, or a 10/20
-# timeout mismatch) that the matcher-only check above misses.
+# must agree across both shipped plugin manifests. Command STRINGS legitimately
+# differ by host (CLAUDE_PLUGIN_ROOT vs PLUGIN_ROOT), so only the stable
+# trailing subcommand token is compared, not the whole command. This catches a
+# copy-paste swap (e.g. Stop wired to hook-post-tool, or a 10/20 timeout
+# mismatch) that the matcher-only check above misses, and it holds the renderer
+# itself to the contract rather than only checking the files against each other.
 hook_subcommand() {
   jq -r ".hooks.${2}[0].hooks[0].command" "$1" \
     | grep -oE 'hook-(pre-tool|post-tool|stop|user-prompt)' | tail -n1
@@ -312,29 +573,25 @@ for event in PreToolUse PostToolUse Stop UserPromptSubmit; do
     not_ok "$event command invokes $expected_sub in hooks/hooks.json (got: $claude_sub)"
   fi
 
-  for file in \
-    "$PLUGIN_ROOT/hooks.json" \
-    "$ROOT/examples/claude/settings.project.json" \
-    "$ROOT/examples/codex/hooks.json"; do
-    actual_type=$(jq -r ".hooks.${event}[0].hooks[0].type" "$file")
-    actual_timeout=$(jq -r ".hooks.${event}[0].hooks[0].timeout" "$file")
-    actual_sub=$(hook_subcommand "$file" "$event")
-    if [ "$actual_type" = "$claude_type" ]; then
-      ok "$event hook type in $file matches hooks/hooks.json"
-    else
-      not_ok "$event hook type in $file matches hooks/hooks.json (got: $actual_type)"
-    fi
-    if [ "$actual_timeout" = "$claude_timeout" ]; then
-      ok "$event timeout in $file matches hooks/hooks.json"
-    else
-      not_ok "$event timeout in $file matches hooks/hooks.json (got: $actual_timeout)"
-    fi
-    if [ "$actual_sub" = "$claude_sub" ]; then
-      ok "$event command subcommand in $file matches hooks/hooks.json"
-    else
-      not_ok "$event command subcommand in $file matches hooks/hooks.json (got: $actual_sub)"
-    fi
-  done
+  file="$PLUGIN_ROOT/hooks.json"
+  actual_type=$(jq -r ".hooks.${event}[0].hooks[0].type" "$file")
+  actual_timeout=$(jq -r ".hooks.${event}[0].hooks[0].timeout" "$file")
+  actual_sub=$(hook_subcommand "$file" "$event")
+  if [ "$actual_type" = "$claude_type" ]; then
+    ok "$event hook type in $file matches hooks/hooks.json"
+  else
+    not_ok "$event hook type in $file matches hooks/hooks.json (got: $actual_type)"
+  fi
+  if [ "$actual_timeout" = "$claude_timeout" ]; then
+    ok "$event timeout in $file matches hooks/hooks.json"
+  else
+    not_ok "$event timeout in $file matches hooks/hooks.json (got: $actual_timeout)"
+  fi
+  if [ "$actual_sub" = "$claude_sub" ]; then
+    ok "$event command subcommand in $file matches hooks/hooks.json"
+  else
+    not_ok "$event command subcommand in $file matches hooks/hooks.json (got: $actual_sub)"
+  fi
 done
 
 # SessionStart reports dependency readiness on both hosts and version drift for
@@ -352,29 +609,15 @@ codex_ss_matcher=$(jq -r '.hooks.SessionStart[0].matcher' "$PLUGIN_ROOT/hooks.js
   && ok "Codex SessionStart matcher matches the supported lifecycle set" \
   || not_ok "Codex SessionStart matcher matches the supported lifecycle set (got: $codex_ss_matcher)"
 
-# Both standalone examples must carry the same SessionStart coverage as the
-# plugin manifests: the degraded-setup warning is host-neutral, so leaving it
-# out of one host's example is a per-tool coverage gap, not a host difference.
-for file in \
-  "$ROOT/examples/claude/settings.project.json" \
-  "$ROOT/examples/codex/hooks.json"; do
-  ex_ss_matcher=$(jq -r '.hooks.SessionStart[0].matcher // empty' "$file")
-  ex_ss_timeout=$(jq -r '.hooks.SessionStart[0].hooks[0].timeout // empty' "$file")
-  ex_ss_sub=$(jq -r '.hooks.SessionStart[0].hooks[0].command // empty' "$file" \
-    | grep -oE 'hook-session-start' | tail -n1)
-  if [ "$ex_ss_matcher" = "$ss_hook_matcher" ] \
-     && [ "$ex_ss_timeout" = "$ss_hook_timeout" ] \
-     && [ "$ex_ss_sub" = "hook-session-start" ]; then
-    ok "SessionStart hook in $file matches the plugin manifests"
-  else
-    not_ok "SessionStart hook in $file matches the plugin manifests (matcher: $ex_ss_matcher, timeout: $ex_ss_timeout, sub: $ex_ss_sub)"
-  fi
-done
+# SessionStart coverage in the standalone examples is enforced by the renderer
+# --check assertion below: the degraded-setup warning is host-neutral, and both
+# examples are rendered from the same table as the plugin manifests, so an
+# example cannot lose the event without the check failing.
 case "$ss_hook_command" in
-  *'CLAUDE_PLUGIN_ROOT'*'/current/bin/agent-guard'*'hook-session-start'*)
-    ok "SessionStart command resolves hook-session-start through the stable current path" ;;
+  *'CLAUDE_PLUGIN_ROOT'*'root_ok'*'r/bin/agent-guard'*'hook-session-start'*)
+    ok "SessionStart command prefers the host-selected complete plugin root" ;;
   *)
-    not_ok "SessionStart command resolves hook-session-start through the stable current path (got: $ss_hook_command)" ;;
+    not_ok "SessionStart command prefers the host-selected complete plugin root (got: $ss_hook_command)" ;;
 esac
 if [ "$ss_hook_timeout" = 5 ]; then
   ok "SessionStart timeout is 5 in hooks/hooks.json"
@@ -383,14 +626,15 @@ else
 fi
 
 claude_pre_tool_command=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$PLUGIN_ROOT/hooks/hooks.json")
-case "$claude_pre_tool_command" in
-  *'CLAUDE_PLUGIN_ROOT'*'/current/bin/agent-guard'*'awk -F'*'/^[0-9]+'*'/bin/agent-guard'*)
-    ok "Claude hook command uses the stable current path with a version-glob fallback"
-    ;;
-  *)
-    not_ok "Claude hook command uses the stable current path with a version-glob fallback"
-    ;;
-esac
+if printf '%s' "$claude_pre_tool_command" | grep -Fq 'CLAUDE_PLUGIN_ROOT' \
+   && printf '%s' "$claude_pre_tool_command" | grep -Fq 'root_ok "$r" "$v"' \
+   && printf '%s' "$claude_pre_tool_command" | grep -Fq 'x="$r/bin/agent-guard"' \
+   && printf '%s' "$claude_pre_tool_command" | grep -Fq 'root_ok "$q" "$v"' \
+   && printf '%s' "$claude_pre_tool_command" | grep -Fq 'sort -t.'; then
+  ok "Claude hook command prefers the selected root with a complete-cache recovery fallback"
+else
+  not_ok "Claude hook command prefers the selected root with a complete-cache recovery fallback"
+fi
 case "$claude_pre_tool_command" in
   *'CODEX_PLUGIN_ROOT'*|*'${PLUGIN_ROOT'*)
     not_ok "Claude hook command does not depend on Codex or generic plugin root env vars"
@@ -401,14 +645,15 @@ case "$claude_pre_tool_command" in
 esac
 
 codex_pre_tool_command=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$PLUGIN_ROOT/hooks.json")
-case "$codex_pre_tool_command" in
-  *'PLUGIN_ROOT'*'/current/bin/agent-guard'*'awk -F'*'/^[0-9]+'*'/bin/agent-guard'*)
-    ok "Codex hook command uses the stable current path with a version-glob fallback"
-    ;;
-  *)
-    not_ok "Codex hook command uses the stable current path with a version-glob fallback"
-    ;;
-esac
+if printf '%s' "$codex_pre_tool_command" | grep -Fq 'PLUGIN_ROOT' \
+   && printf '%s' "$codex_pre_tool_command" | grep -Fq 'root_ok "$r" "$v"' \
+   && printf '%s' "$codex_pre_tool_command" | grep -Fq 'x="$r/bin/agent-guard"' \
+   && printf '%s' "$codex_pre_tool_command" | grep -Fq 'root_ok "$q" "$v"' \
+   && printf '%s' "$codex_pre_tool_command" | grep -Fq 'sort -t.'; then
+  ok "Codex hook command prefers the selected root with a complete-cache recovery fallback"
+else
+  not_ok "Codex hook command prefers the selected root with a complete-cache recovery fallback"
+fi
 case "$codex_pre_tool_command" in
   *'CLAUDE_PLUGIN_ROOT'*|*'CODEX_PLUGIN_ROOT'*)
     not_ok "Codex hook command does not depend on host-specific plugin root env vars"
@@ -461,6 +706,70 @@ if sh "$ROOT/scripts/render-hook-manifests.sh" --check >/dev/null 2>&1; then
 else
   not_ok "hook manifests match scripts/render-hook-manifests.sh output"
 fi
+
+# Must-fail control for the check above: a passing --check is only evidence if
+# --check can fail. A renderer that silently stopped covering one of the four
+# files would otherwise report success. Perturbation happens in a throwaway
+# copy, never the working tree.
+render_check_tree="$TESTTMP/render-check"
+for target in \
+  plugins/agent-guard/hooks.json \
+  plugins/agent-guard/hooks/hooks.json \
+  examples/codex/hooks.json \
+  examples/claude/settings.project.json; do
+  rm -rf "$render_check_tree"
+  mkdir -p "$render_check_tree/scripts"
+  cp "$ROOT/scripts/render-hook-manifests.sh" "$render_check_tree/scripts/"
+  for copy in \
+    plugins/agent-guard/hooks.json \
+    plugins/agent-guard/hooks/hooks.json \
+    examples/codex/hooks.json \
+    examples/claude/settings.project.json; do
+    mkdir -p "$render_check_tree/$(dirname "$copy")"
+    cp "$ROOT/$copy" "$render_check_tree/$copy"
+  done
+  jq '.hooks.Stop[0].hooks[0].timeout = 99' "$ROOT/$target" \
+    >"$render_check_tree/$target.tmp" \
+    && mv "$render_check_tree/$target.tmp" "$render_check_tree/$target"
+  if sh "$render_check_tree/scripts/render-hook-manifests.sh" --check >/dev/null 2>&1; then
+    not_ok "render-hook-manifests.sh --check rejects a drifted $target"
+  else
+    ok "render-hook-manifests.sh --check rejects a drifted $target"
+  fi
+done
+rm -rf "$render_check_tree"
+
+# The four places below are deliberately NOT deduplicated: the awk kind letters
+# also encode whether a format needs whole-file context (go.sum -> g,
+# package-lock -> P), so a shared table would be more machinery than the
+# duplication costs, in a security parser. Assert the sets match instead —
+# adding a sixth lockfile to three of the four lists fails here.
+lockfile_kind_table=$(sed -n '/^filter_lockfile_hashes()/,/^}/p' "$PLUGIN_ROOT/bin/agent-guard" \
+  | sed -n 's/^  *\([A-Za-z0-9.-]*\)) kind=[a-z] ;;$/\1/p' | sort)
+lockfile_awk_kind=$(sed -n "/^AWK_LOCKFILE_KIND=/,/^'\$/p" "$PLUGIN_ROOT/bin/agent-guard" \
+  | sed -n 's/.*name == "\([^"]*\)".*/\1/p' | sort)
+lockfile_find_names=$(sed -n '/^scan_lockfiles_under()/,/^}/p' "$PLUGIN_ROOT/bin/agent-guard" \
+  | grep -oE '\-name [A-Za-z0-9.-]+' | sed 's/^-name //' | sort)
+lockfile_allowlist=$(awk -F'[()]' '/\(\^\|\/\)\(/ {print $4}' "$PLUGIN_ROOT/config/gitleaks.toml" \
+  | tr '|' '\n' | sed 's/\\//g' | sort)
+
+if [ -n "$lockfile_kind_table" ]; then
+  ok "lockfile kind table is non-empty (extraction still matches the source)"
+else
+  not_ok "lockfile kind table is non-empty (extraction still matches the source)"
+fi
+for other in awk_kind find_names allowlist; do
+  case "$other" in
+    awk_kind) other_set=$lockfile_awk_kind; other_label="awk lockfile_kind()" ;;
+    find_names) other_set=$lockfile_find_names; other_label="scan_lockfiles_under find" ;;
+    allowlist) other_set=$lockfile_allowlist; other_label="gitleaks.toml allowlist" ;;
+  esac
+  if [ "$other_set" = "$lockfile_kind_table" ]; then
+    ok "$other_label covers the same lockfiles as filter_lockfile_hashes"
+  else
+    not_ok "$other_label covers the same lockfiles as filter_lockfile_hashes (got: $(printf '%s' "$other_set" | tr '\n' ' '))"
+  fi
+done
 
 read_env_payload='{"tool_name":"Read","tool_input":{"file_path":".env"}}'
 # Each invocation that must WARN gets its own TMPDIR: the resolver's warn-once
@@ -580,32 +889,76 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
-# A stale hook can retain a removed version directory in PLUGIN_ROOT. The
-# manifest-level resolver must select the highest installed semantic version,
-# not rely on lexical glob order (where 3.0.9 sorts after 3.0.10).
+# A stale hook can retain a removed version directory in PLUGIN_ROOT. Recovery
+# may select the highest complete semantic version, but an existing complete
+# host-selected root remains authoritative.
 HOOK_CACHE="$TESTTMP/hook-cache"
 for hook_ver in 3.0.9 3.0.10 99.0.0beta; do
   mkdir -p "$HOOK_CACHE/$hook_ver/bin"
   cat >"$HOOK_CACHE/$hook_ver/bin/agent-guard" <<EOF
 #!/usr/bin/env sh
+VERSION=$hook_ver
 printf '%s\n' 'selected-$hook_ver'
 EOF
   chmod +x "$HOOK_CACHE/$hook_ver/bin/agent-guard"
+  case "$hook_ver" in
+    3.0.9|3.0.10)
+      mkdir -p "$HOOK_CACHE/$hook_ver/config"
+      : >"$HOOK_CACHE/$hook_ver/config/gitleaks.toml"
+      : >"$HOOK_CACHE/$hook_ver/config/deny-read-paths.txt"
+      : >"$HOOK_CACHE/$hook_ver/config/deny-bash-patterns.txt"
+      ;;
+  esac
 done
+
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo clean"}}' \
+  | PLUGIN_ROOT="$HOOK_CACHE/3.0.9" sh -c "$codex_pre_tool_command" >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ] && grep -qx 'selected-3.0.9' "$OUT" \
+   && [ ! -e "$HOOK_CACHE/current" ]; then
+  ok "Codex hook resolver keeps the complete host-selected plugin authoritative"
+else
+  not_ok "Codex hook resolver keeps the complete host-selected plugin authoritative"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo clean"}}' \
   | PLUGIN_ROOT="$HOOK_CACHE/3.0.0" sh -c "$codex_pre_tool_command" >"$OUT" 2>"$ERR"
 status=$?
 if [ "$status" -eq 0 ] && grep -qx 'selected-3.0.10' "$OUT" \
-   && [ "$(readlink "$HOOK_CACHE/current" 2>/dev/null)" = 3.0.10 ]; then
-  ok "Codex hook resolver falls back from a removed version to the latest installed version"
+   && [ ! -e "$HOOK_CACHE/current" ]; then
+  ok "Codex hook resolver recovers from a removed root with the latest complete version"
 else
-  not_ok "Codex hook resolver falls back from a removed version to the latest installed version"
+  not_ok "Codex hook resolver recovers from a removed root with the latest complete version"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+mkdir -p "$HOOK_CACHE/4.0.0/bin"
+cat >"$HOOK_CACHE/4.0.0/bin/agent-guard" <<'EOF'
+#!/usr/bin/env sh
+VERSION=4.0.0
+printf '%s\n' selected-incomplete
+EOF
+chmod +x "$HOOK_CACHE/4.0.0/bin/agent-guard"
+printf '%s' '{"session_id":"incomplete-root","tool_name":"Bash","tool_input":{"command":"cat .env"}}' \
+  | PLUGIN_ROOT="$HOOK_CACHE/4.0.0" \
+    AGENT_GUARD_WARNING_DIR="$TESTTMP/incomplete-root-warning" \
+    sh -c "$codex_pre_tool_command" >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ] && [ ! -s "$OUT" ] \
+   && grep -q 'selected root was incomplete' "$ERR"; then
+  ok "Codex hook resolver refuses an incomplete selected root without sibling substitution"
+else
+  not_ok "Codex hook resolver refuses an incomplete selected root without sibling substitution"
   sed 's/^/  stdout: /' "$OUT"
   sed 's/^/  stderr: /' "$ERR"
 fi
 
 cat >"$HOOK_CACHE/3.0.10/bin/agent-guard" <<'EOF'
 #!/usr/bin/env sh
+VERSION=3.0.10
 cat
 EOF
 chmod +x "$HOOK_CACHE/3.0.10/bin/agent-guard"
@@ -755,17 +1108,25 @@ fi
 # merge. Build a self-contained mirror so matching, stale, malformed, and dirty
 # inputs can be exercised without modifying the repository's template.
 SUBMIRROR="$TMP_ROOT/submission-mirror"
-SUBENTRY="$SUBMIRROR/docs/submission/marketplace-entry.template.json"
+SUBENTRY="$SUBMIRROR/scripts/marketplace-entry.template.json"
 SUBVALIDATOR="$SUBMIRROR/scripts/validate-submission-readiness.sh"
 SUBRENDERER="$SUBMIRROR/scripts/render-submission-entry.sh"
 SUBREMOTE="$TMP_ROOT/submission-remote.git"
 mkdir -p "$SUBMIRROR"
 if git -C "$ROOT" archive HEAD | tar -x -C "$SUBMIRROR" 2>/dev/null; then
-  # Run the working-tree scripts and template under test, not HEAD's committed
-  # copies. The current worktree may not have been committed yet.
+  # Run the working-tree plugin payload, public policy mirrors, scripts, and
+  # template under test, not HEAD's committed copies. The current worktree may
+  # not have been committed yet; using only `git archive HEAD` here previously
+  # hid root/plugin policy drift until CI tested the resulting commit.
+  rm -rf "$SUBMIRROR/plugins/agent-guard"
+  mkdir -p "$SUBMIRROR/plugins/agent-guard"
+  cp -R "$PLUGIN_ROOT/." "$SUBMIRROR/plugins/agent-guard/"
+  for policy_file in README.md LICENSE PRIVACY.md SECURITY.md SUPPORT.md THIRD_PARTY_NOTICES.md; do
+    cp "$ROOT/$policy_file" "$SUBMIRROR/$policy_file"
+  done
   cp "$ROOT/scripts/validate-submission-readiness.sh" "$SUBVALIDATOR"
   cp "$ROOT/scripts/render-submission-entry.sh" "$SUBRENDERER"
-  cp "$ROOT/docs/submission/marketplace-entry.template.json" "$SUBENTRY"
+  cp "$ROOT/scripts/marketplace-entry.template.json" "$SUBENTRY"
   (
     cd "$SUBMIRROR" || exit 2
     git init -q
@@ -843,7 +1204,7 @@ if git -C "$ROOT" archive HEAD | tar -x -C "$SUBMIRROR" 2>/dev/null; then
     not_ok "dirty submission template fails before rendering a catalog entry"
     sed 's/^/  stderr: /' "$ERR"
   fi
-  git -C "$SUBMIRROR" checkout -q -- docs/submission/marketplace-entry.template.json
+  git -C "$SUBMIRROR" checkout -q -- scripts/marketplace-entry.template.json
 
   run_expect 1 "submission renderer refuses to overwrite its tracked template" \
     env AGENT_GUARD_SUBMISSION_SHA="$match_sha" \
@@ -965,6 +1326,114 @@ expect_json_status 2 "negative glob does not hide a chained denied read" \
   '{"tool_name":"Bash","tool_input":{"command":"rg --files -g '\''!*.pem'\'' && cat secret.pem"}}' \
   hook-pre-tool
 
+# The Bash path gate stays fail-closed on path-shaped text (#99). What it must
+# not stay is opaque: a block has to name the deny-read entry that matched, the
+# text that matched it, and the fact that a non-path-shaped rewrite is the fix,
+# so a false positive is self-serviceable without weakening the deny list.
+expect_stderr_contains() {
+  expected_fragment=$1
+  name=$2
+  if grep -Fq "$expected_fragment" "$ERR"; then
+    ok "$name"
+  else
+    not_ok "$name"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+}
+
+expect_stderr_missing() {
+  unexpected_fragment=$1
+  name=$2
+  if grep -Fq "$unexpected_fragment" "$ERR"; then
+    not_ok "$name"
+    sed 's/^/  stderr: /' "$ERR"
+  else
+    ok "$name"
+  fi
+}
+
+expect_json_status 2 "path-shaped echo operand stays blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"echo foo.key"}}' \
+  hook-pre-tool
+expect_stderr_contains "matched deny-read-paths entry '*.key'" \
+  "Bash path block names the deny-read entry that matched"
+expect_stderr_missing "in scanned text" \
+  "Bash path block quotes no raw command text"
+expect_stderr_contains "rewrite" \
+  "Bash path block suggests a non-path-shaped rewrite"
+
+expect_json_status 2 "jq selector false positive reports its deny-read entry" \
+  '{"tool_name":"Bash","tool_input":{"command":"jq '\''.key'\'' d.json"}}' \
+  hook-pre-tool
+expect_stderr_contains "matched deny-read-paths entry '*.key'" \
+  "jq selector block names the deny-read entry that matched"
+
+expect_json_status 2 "URL path false positive reports its deny-read entry" \
+  '{"tool_name":"Bash","tool_input":{"command":"curl https://example.com/a.pem"}}' \
+  hook-pre-tool
+expect_stderr_contains "matched deny-read-paths entry '*.pem'" \
+  "URL block names the deny-read entry that matched"
+
+expect_json_status 0 "allowed Bash command emits no deny-read diagnosis" \
+  '{"tool_name":"Bash","tool_input":{"command":"ls *.md"}}' \
+  hook-pre-tool
+expect_stderr_missing "matched deny-read-paths entry" \
+  "allowed Bash command emits no deny-read diagnosis"
+
+# The diagnosis must not become a leak channel. Both wildcards in the match
+# regex swallow whatever else shares the shell word: a deny entry's own trailing
+# `*` (`.env*`) eats a URL query string, and the `<prefix>/` alternative eats a
+# userinfo field or a directory component. An excerpt of the matched text can
+# therefore carry a credential, and this branch exits before any scanner runs,
+# so nothing downstream would redact it. The deny entry is public policy text
+# and is the whole report. Token is runtime-generated: a committed literal would
+# trip the repo's own scan-path CI. od -N is bounded and exits on its own; the
+# tr|head urandom idiom hangs on runners that ignore SIGPIPE.
+bash_diag_token=$(od -An -N18 -tx1 /dev/urandom | LC_ALL=C tr -d ' \n')
+
+bash_diag_no_leak() { # $1 name, $2 command carrying the token
+  expect_json_status 2 "$1 stays blocked" \
+    "$(jq -nc --arg c "$2" '{tool_name:"Bash",tool_input:{command:$c}}')" \
+    hook-pre-tool
+  expect_stderr_missing "$bash_diag_token" "$1 leaks no credential to stderr"
+}
+
+bash_diag_no_leak "deny-entry wildcard eating a URL query" \
+  "curl https://example.com/.env?token=$bash_diag_token"
+bash_diag_no_leak "prefix wildcard eating a URL userinfo field" \
+  "curl https://user:$bash_diag_token@example.com/.env"
+bash_diag_no_leak "prefix wildcard eating a directory component" \
+  "cat /home/$bash_diag_token/id_rsa"
+
+# The diagnosis is the whole fix: no command-name exemption was added, so every
+# shape that merely looks safe must still block. `git commit -m` in particular
+# is NOT exempt -- a shadowed `git` (alias, function, PATH shim) could hand that
+# operand to a reader, which is exactly the case README's Known Limitations
+# refuses to exempt by apparent command name.
+expect_json_status 2 "git commit message operand is not exempt" \
+  '{"tool_name":"Bash","tool_input":{"command":"git commit -m '\''fix foo.key parse'\''"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "double-quoted git commit message operand is not exempt" \
+  '{"tool_name":"Bash","tool_input":{"command":"git commit -m \"fix foo.key parse\""}}' \
+  hook-pre-tool
+
+expect_json_status 2 "attached git commit message operand is not exempt" \
+  '{"tool_name":"Bash","tool_input":{"command":"git commit --message='\''drop secret.pem'\''"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "git commit -F still treats its operand as a file" \
+  '{"tool_name":"Bash","tool_input":{"command":"git commit -F secret.pem"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "a shadowed git before a commit-shaped read stays blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"git() { cat \"$3\"; }; git commit -m id_rsa"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "a commit-shaped operand chained to a real read stays blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"git commit -m ok && cat secret.pem"}}' \
+  hook-pre-tool
+
 expect_json_status 2 "Bash command literal secret is blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"printf AGENT_GUARD_TEST_SECRET > leaked.txt"}}' \
   hook-pre-tool
@@ -1017,6 +1486,75 @@ expect_json_status 0 "broad Grep content search for benign text is allowed" \
   '{"tool_name":"Grep","tool_input":{"pattern":"TODO","path":".","output_mode":"content"}}' \
   hook-pre-tool
 
+# #187: a Grep content pattern is a regex, not a read target; only path-shaped
+# fields (path, glob) and unknown fields go through the deny-path gate.
+expect_json_status 0 "#187 Grep pattern that looks like a deny-listed name is allowed" \
+  '{"tool_name":"Grep","tool_input":{"pattern":".key","path":"."}}' \
+  hook-pre-tool
+
+expect_json_status 0 "#187 Grep pattern ending in a deny-listed extension is allowed" \
+  '{"tool_name":"Grep","tool_input":{"pattern":"foo.key"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "#187 Grep pattern naming a deny-listed basename is allowed" \
+  '{"tool_name":"Grep","tool_input":{"pattern":".env","path":".","output_mode":"files_with_matches"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "#187 Grep pattern naming a deny-listed key file is allowed" \
+  '{"tool_name":"Grep","tool_input":{"pattern":"id_rsa","path":"."}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Grep path on a deny-listed file still blocks with a benign pattern" \
+  '{"tool_name":"Grep","tool_input":{"pattern":"TODO","path":".env"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Grep glob selecting deny-listed files still blocks" \
+  '{"tool_name":"Grep","tool_input":{"pattern":"TODO","path":".","glob":"*.pem"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Grep unknown string field naming a deny-listed path still blocks" \
+  '{"tool_name":"Grep","tool_input":{"pattern":"TODO","path":".","extra":"id_rsa"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Glob pattern is a path glob and still blocks" \
+  '{"tool_name":"Glob","tool_input":{"pattern":"*.pem","path":"."}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Glob pattern naming dotenv files still blocks" \
+  '{"tool_name":"Glob","tool_input":{"pattern":".env*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Grep with a JSON-encoded tool_input still blocks on path" \
+  '{"tool_name":"Grep","tool_input":"{\"pattern\":\"TODO\",\"path\":\".env\"}"}' \
+  hook-pre-tool
+
+expect_json_status 0 "#187 Grep with a JSON-encoded tool_input still exempts pattern" \
+  '{"tool_name":"Grep","tool_input":"{\"pattern\":\".key\",\"path\":\".\"}"}' \
+  hook-pre-tool
+
+# The exemption covers a content regex only: an option-shaped pattern could make
+# ripgrep read patterns FROM a file on a host that passes it positionally, and a
+# non-string pattern is not a regex. Both stay under the every-leaf gate.
+expect_json_status 2 "#187 Grep option-shaped pattern naming a deny-listed file still blocks" \
+  '{"tool_name":"Grep","tool_input":{"pattern":"--file=.env","path":"."}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Grep short-option pattern naming a deny-listed file still blocks" \
+  '{"tool_name":"Grep","tool_input":{"pattern":"-f.env","path":"."}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Grep object-valued pattern naming a deny-listed path still blocks" \
+  '{"tool_name":"Grep","tool_input":{"pattern":{"path":".env"}}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Grep array-valued pattern naming a deny-listed path still blocks" \
+  '{"tool_name":"Grep","tool_input":{"pattern":[".env"]}}' \
+  hook-pre-tool
+
+expect_json_status 2 "#187 Grep secret-shaped pattern in broad content mode still blocks" \
+  '{"tool_name":"Grep","tool_input":{"pattern":"private.key","path":".","output_mode":"content"}}' \
+  hook-pre-tool
+
 expect_json_status 2 "Codex Add File payload secret is blocked" \
   '{"tool_name":"apply_patch","tool_input":{"patch":"*** Begin Patch\n*** Add File: x\nAGENT_GUARD_TEST_SECRET\n*** End Patch"}}' \
   hook-pre-tool
@@ -1054,6 +1592,18 @@ expect_json_status 2 "MCP input secret is blocked" \
   '{"tool_name":"mcp__server__tool","tool_input":{"token":"AGENT_GUARD_TEST_SECRET"}}' \
   hook-pre-tool
 
+expect_json_status 2 "Agent delegation input secret is blocked" \
+  '{"tool_name":"Agent","tool_input":{"subagent_type":"Explore","prompt":"inspect AGENT_GUARD_TEST_SECRET"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "legacy Task delegation input secret is blocked" \
+  '{"tool_name":"Task","tool_input":{"subagent_type":"Explore","prompt":"inspect AGENT_GUARD_TEST_SECRET"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "benign Agent delegation input is allowed" \
+  '{"tool_name":"Agent","tool_input":{"subagent_type":"Explore","prompt":"map the public API"}}' \
+  hook-pre-tool
+
 expect_json_status 2 "WebFetch file URL to sensitive path is blocked" \
   '{"tool_name":"WebFetch","tool_input":{"url":"file:///.env","prompt":"summarize"}}' \
   hook-pre-tool
@@ -1079,6 +1629,14 @@ expect_json_status 0 "WebSearch benign query is allowed" \
 prompt_guard_fake_value=$(od -An -N12 -tx1 /dev/urandom | LC_ALL=C tr -d ' \n')
 prompt_guard_env_json=$(jq -nc --arg v "$prompt_guard_fake_value" \
   '{prompt: ("pasted .env:\nDB_PASSWORD=" + $v)}')
+prompt_guard_placeholders_json=$(jq -nc --arg prompt \
+  'API_KEY=example_token
+TOKEN="Example-Key"
+CLIENT_SECRET=DUMMY_SECRET
+PASSWORD=not-a-real-password' \
+  '{prompt:$prompt}')
+prompt_guard_placeholder_lookalike_json=$(jq -nc \
+  --arg prompt 'API_KEY=example_token_value_long' '{prompt:$prompt}')
 
 prompt_guard_case() { # $1 host, $2 prompt mode ('' = default), $3 pii mode ('' = off), $4 json
   printf '%s' "$4" \
@@ -1093,6 +1651,12 @@ for pg_h in claude codex; do
 
   run_expect 2 "prompt guard blocks a pasted env-style assignment ($pg_h)" \
     prompt_guard_case "$pg_h" '' '' "$prompt_guard_env_json"
+
+  run_expect 0 "prompt guard allows exact documentation placeholders ($pg_h)" \
+    prompt_guard_case "$pg_h" '' '' "$prompt_guard_placeholders_json"
+
+  run_expect 2 "prompt guard blocks a decorated placeholder lookalike ($pg_h)" \
+    prompt_guard_case "$pg_h" '' '' "$prompt_guard_placeholder_lookalike_json"
 
   prompt_guard_case "$pg_h" '' '' '{"prompt":"please refactor the login handler"}' >"$OUT" 2>"$ERR"
   if [ $? -eq 0 ] && [ ! -s "$OUT" ]; then
@@ -1204,7 +1768,12 @@ run_expect 2 "prompt guard dies loudly on an unsupported PII mode" \
 # concatenated documents on stdout, so a host parsing stdout as one document
 # dropped the promised warning entirely. Assert a single document that still
 # carries both facts — `grep systemMessage` alone passes on the broken shape.
-printf '#!/bin/sh\nexit 3\n' >"$MOCK_BIN/gitleaks-broken"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'case "${1:-}" in' \
+  '  version) printf "%s\\n" "8.30.1"; exit 0 ;;' \
+  '  *) exit 3 ;;' \
+  'esac' >"$MOCK_BIN/gitleaks-broken"
 chmod +x "$MOCK_BIN/gitleaks-broken"
 prompt_infra_case() { # $1 host, $2 warning dir
   printf '%s' "$prompt_guard_env_json" \
@@ -1273,6 +1842,310 @@ if [ "$big_prompt_status" -eq 0 ] && [ "$big_prompt_elapsed" -le 8 ]; then
   ok "prompt guard skips the probe above the scan cap within the hook budget (${big_prompt_elapsed}s)"
 else
   not_ok "prompt guard skips the probe above the scan cap within the hook budget (status $big_prompt_status, ${big_prompt_elapsed}s)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Every tool/stop hook must reject malformed JSON independently of the scanner
+# infrastructure policy. The input cannot be inspected safely, so default-open
+# must not forward it and repeated failures must each remain visible.
+for malformed_case in \
+  'hook-pre-tool:PreToolUse' \
+  'hook-post-tool:PostToolUse' \
+  'hook-stop:Stop'; do
+  malformed_cmd=${malformed_case%%:*}
+  malformed_event=${malformed_case#*:}
+  printf '%s' '{not-json' \
+    | AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/malformed-$malformed_cmd-closed" \
+      "$PLUGIN_ROOT/bin/agent-guard" "$malformed_cmd" >"$OUT" 2>"$ERR"
+  malformed_status=$?
+  if [ "$malformed_status" -eq 2 ] \
+     && grep -q "$malformed_event hook input was not a JSON object" "$ERR"; then
+    ok "$malformed_cmd closed policy blocks malformed JSON"
+  else
+    not_ok "$malformed_cmd closed policy blocks malformed JSON (status $malformed_status)"
+    sed 's/^/  stdout: /' "$OUT"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  printf '%s' '[]' \
+    | AGENT_GUARD_INFRA_FAILURE_MODE=open \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/malformed-$malformed_cmd-open" \
+      "$PLUGIN_ROOT/bin/agent-guard" "$malformed_cmd" >"$OUT" 2>"$ERR"
+  malformed_status=$?
+  if [ "$malformed_status" -eq 2 ] \
+     && grep -q "$malformed_event hook input was not a JSON object" "$ERR"; then
+    ok "$malformed_cmd blocks a non-object JSON payload under open infrastructure policy"
+  else
+    not_ok "$malformed_cmd blocks a non-object JSON payload under open infrastructure policy (status $malformed_status)"
+    sed 's/^/  stdout: /' "$OUT"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+make_deep_post_tool_input() {
+  deep_count=$1
+  printf '%s' '{"session_id":"deep-repeat","tool_name":"Read","tool_input":{},"tool_response":'
+  awk -v count="$deep_count" 'BEGIN { for (i = 0; i < count; i++) printf "[" }'
+  printf '"%s%s%s%s"' 'PASS' 'WORD=' 'K7mQ2vN9xR4c' 'T8pL6sW3'
+  awk -v count="$deep_count" 'BEGIN { for (i = 0; i < count; i++) printf "]" }'
+  printf '%s' '}'
+}
+
+make_deep_post_tool_expected() {
+  deep_count=$1
+  deep_leaf=${2:-'PASSWORD=[REDACTED]'}
+  printf '%s' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":'
+  awk -v count="$deep_count" 'BEGIN { for (i = 0; i < count; i++) printf "[" }'
+  printf '"%s"' "$deep_leaf"
+  awk -v count="$deep_count" 'BEGIN { for (i = 0; i < count; i++) printf "]" }'
+  printf '%s\n' '}}'
+}
+
+deep_expected_200="$TESTTMP/deep-expected-200"
+make_deep_post_tool_expected 200 >"$deep_expected_200"
+make_deep_post_tool_input 200 \
+  | AGENT_GUARD_INFRA_FAILURE_MODE=open \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+deep_status=$?
+if [ "$deep_status" -eq 0 ] \
+   && cmp -s "$deep_expected_200" "$OUT"; then
+  ok "post-tool masks output nested to depth 200"
+else
+  not_ok "post-tool masks output nested to depth 200 (status $deep_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+for deep_count in 2000 20000; do
+  deep_expected="$TESTTMP/deep-expected-$deep_count"
+  deep_conservative_expected="$TESTTMP/deep-conservative-expected-$deep_count"
+  make_deep_post_tool_expected "$deep_count" >"$deep_expected"
+  make_deep_post_tool_expected "$deep_count" '[REDACTED]' >"$deep_conservative_expected"
+  make_deep_post_tool_input "$deep_count" \
+    | AGENT_GUARD_INFRA_FAILURE_MODE=open \
+      AGENT_GUARD_SESSION_ID=deep-repeat \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/deep-repeat-warning" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+  deep_status=$?
+  deep_out_bytes=$(wc -c <"$OUT" | tr -d '[:space:]')
+  deep_expected_bytes=$(wc -c <"$deep_expected" | tr -d '[:space:]')
+  deep_conservative_expected_bytes=$(wc -c <"$deep_conservative_expected" | tr -d '[:space:]')
+  # Exact length and byte equality prove both native nested-array shape and one
+  # top-level document without asking the runner's jq to parse this depth. A
+  # bare string or any appended JSON document necessarily fails. jq-capable
+  # runners preserve the assignment label; the independent recovery parser
+  # conservatively replaces the complete leaf when jq rejects the envelope.
+  if [ "$deep_status" -eq 0 ] \
+     && { { [ "$deep_out_bytes" = "$deep_expected_bytes" ] \
+            && cmp -s "$deep_expected" "$OUT"; } \
+          || { [ "$deep_out_bytes" = "$deep_conservative_expected_bytes" ] \
+               && cmp -s "$deep_conservative_expected" "$OUT"; }; }; then
+    ok "post-tool safely handles output nested to depth $deep_count"
+  else
+    not_ok "post-tool safely handles output nested to depth $deep_count (status $deep_status)"
+    sed 's/^/  stdout: /' "$OUT"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+# jq nesting limits vary by build, so force validation failure independently of
+# depth. Both invocations use one session and warning directory: each must emit
+# a complete replacement, independent of infrastructure-warning deduplication.
+FAIL_VALIDATE_JQ_DIR="$TMP_ROOT/fail-validate-jq"
+FAIL_VALIDATE_JQ="$FAIL_VALIDATE_JQ_DIR/jq"
+mkdir -p "$FAIL_VALIDATE_JQ_DIR"
+{
+  printf '%s\n' '#!/bin/sh'
+  printf '%s\n' 'case "$*" in'
+  printf '%s\n' '  *"type == \"object\""*) exit 2 ;;'
+  printf '%s\n' 'esac'
+  printf '%s\n' 'exec "${AGENT_GUARD_TEST_REAL_JQ:?}" "$@"'
+} >"$FAIL_VALIDATE_JQ"
+chmod +x "$FAIL_VALIDATE_JQ"
+
+forced_validation_expected="$TESTTMP/forced-validation-expected"
+make_deep_post_tool_expected 0 '[REDACTED]' >"$forced_validation_expected"
+for validate_failure_attempt in 1 2; do
+  make_deep_post_tool_input 0 \
+    | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+      AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+      AGENT_GUARD_INFRA_FAILURE_MODE=open \
+      AGENT_GUARD_SESSION_ID=forced-validation-repeat \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/forced-validation-repeat" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+  forced_validation_status=$?
+  if [ "$forced_validation_status" -eq 0 ] \
+     && cmp -s "$forced_validation_expected" "$OUT" \
+     && ! grep -q 'K7mQ2vN9xR4cT8pL6sW3' "$OUT"; then
+    ok "post-tool replaces output after forced validation failure attempt $validate_failure_attempt"
+  else
+    not_ok "post-tool fails to replace output after forced validation failure attempt $validate_failure_attempt (status $forced_validation_status)"
+    sed 's/^/  stdout: /' "$OUT"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+make_formatted_deep_post_tool_input() {
+  formatted_count=$1
+  printf '%s\n' '{'
+  printf '%s\n' '  "session_id" : "formatted-deep",'
+  printf '%s\n' '  "tool_name" : "Read",'
+  printf '%s\n' '  "tool_input" : {},'
+  printf '%s\n' '  "tool_response" :'
+  awk -v count="$formatted_count" 'BEGIN { for (i = 0; i < count; i++) print "[" }'
+  printf '"%s%s%s%s"\n' 'PASS' 'WORD=' 'K7mQ2vN9xR4c' 'T8pL6sW3'
+  awk -v count="$formatted_count" 'BEGIN { for (i = 0; i < count; i++) print "]" }'
+  printf '%s\n' '}'
+}
+
+formatted_deep_expected="$TESTTMP/formatted-deep-expected"
+make_deep_post_tool_expected 2000 '[REDACTED]' >"$formatted_deep_expected"
+make_formatted_deep_post_tool_input 2000 \
+  | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+formatted_deep_status=$?
+if [ "$formatted_deep_status" -eq 0 ] \
+   && cmp -s "$formatted_deep_expected" "$OUT"; then
+  ok "post-tool validation recovery preserves a formatted depth-2000 array shape"
+else
+  not_ok "post-tool validation recovery loses a formatted depth-2000 array shape (status $formatted_deep_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+formatted_quote_free_expected="$TESTTMP/formatted-quote-free-expected"
+{
+  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":['
+  printf '%s\n' '  0,'
+  printf '%s\n' '  false,'
+  printf '%s\n' '  null'
+  printf '%s\n' '  ]}}'
+} >"$formatted_quote_free_expected"
+{
+  printf '%s\n' '{'
+  printf '%s\n' '  "tool_name" : "Read",'
+  printf '%s\n' '  "tool_input" : {},'
+  printf '%s\n' '  "tool_response" : ['
+  printf '%s\n' '  9876543210123456,'
+  printf '%s\n' '  true,'
+  printf '%s\n' '  null'
+  printf '%s\n' '  ]'
+  printf '%s\n' '}'
+} | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+formatted_quote_free_status=$?
+if [ "$formatted_quote_free_status" -eq 0 ] \
+   && cmp -s "$formatted_quote_free_expected" "$OUT" \
+   && ! grep -q '9876543210123456' "$OUT"; then
+  ok "post-tool validation recovery accepts formatted quote-free JSON values"
+else
+  not_ok "post-tool validation recovery collapses formatted quote-free JSON values (status $formatted_quote_free_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+{
+  printf '%s\n' '{'
+  printf '%s\n' '  "tool_name" : "Read",'
+  printf '%s\n' '  "tool_input" : {},'
+  printf '%s\n' '  "tool_response" : 9876543210123456'
+  printf '%s\n' '}'
+} | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+formatted_scalar_status=$?
+if [ "$formatted_scalar_status" -eq 0 ] \
+   && jq -e '.hookSpecificOutput.updatedToolOutput == 0' "$OUT" >/dev/null 2>&1 \
+   && ! grep -q '9876543210123456' "$OUT"; then
+  ok "post-tool validation recovery accepts a formatted top-level scalar response"
+else
+  not_ok "post-tool validation recovery rejects a formatted top-level scalar response (status $formatted_scalar_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+make_deep_post_tool_input 0 \
+  | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    AGENT_GUARD_HOOK_HOST=codex \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+forced_validation_codex_status=$?
+if [ "$forced_validation_codex_status" -eq 0 ] \
+   && [ "$(jq -s 'length' <"$OUT" 2>/dev/null)" = 1 ] \
+   && jq -e '
+        .decision == "block"
+        and (.hookSpecificOutput.additionalContext | contains("\"[REDACTED]\""))
+      ' "$OUT" >/dev/null 2>&1; then
+  ok "Codex post-tool emits one host-valid replacement after forced validation failure"
+else
+  not_ok "Codex post-tool fails to replace output after forced validation failure (status $forced_validation_codex_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+{
+  printf '%s' '{"session_id":"escaped-response-key","tool_name":"Read","tool_input":{},"tool\u005fresponse":"'
+  printf '%s%s%s%s' 'PASS' 'WORD=' 'K7mQ2vN9xR4c' 'T8pL6sW3'
+  printf '%s' '"}'
+} | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+forced_validation_escaped_key_status=$?
+if [ "$forced_validation_escaped_key_status" -eq 0 ] \
+   && cmp -s "$forced_validation_expected" "$OUT"; then
+  ok "post-tool validation recovery decodes an escaped top-level tool_response key"
+else
+  not_ok "post-tool validation recovery misses an escaped top-level tool_response key (status $forced_validation_escaped_key_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s' '{broken-json' \
+  | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+forced_validation_malformed_status=$?
+if [ "$forced_validation_malformed_status" -eq 2 ] && [ ! -s "$OUT" ] \
+   && grep -q 'PostToolUse hook input was not a JSON object' "$ERR"; then
+  ok "post-tool keeps an explicit diagnostic for a truly malformed envelope"
+else
+  not_ok "post-tool treats a truly malformed envelope as recovered (status $forced_validation_malformed_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+make_deep_post_tool_input 0 \
+  | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    AGENT_GUARD_GITLEAKS_BIN=/nonexistent/gitleaks \
+    AGENT_GUARD_INFRA_FAILURE_MODE=open \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+forced_validation_missing_gitleaks_status=$?
+if [ "$forced_validation_missing_gitleaks_status" -eq 0 ] \
+   && cmp -s "$forced_validation_expected" "$OUT"; then
+  ok "post-tool validation recovery precedes a missing scanner dependency"
+else
+  not_ok "post-tool validation recovery passes through with a missing scanner dependency (status $forced_validation_missing_gitleaks_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+make_deep_post_tool_input 0 \
+  | PATH="$FAIL_VALIDATE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    AGENT_GUARD_DENY_READ_PATHS="$TESTTMP/missing-validation-policy" \
+    AGENT_GUARD_INFRA_FAILURE_MODE=open \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+forced_validation_missing_policy_status=$?
+if [ "$forced_validation_missing_policy_status" -eq 0 ] \
+   && cmp -s "$forced_validation_expected" "$OUT"; then
+  ok "post-tool validation recovery precedes a missing policy dependency"
+else
+  not_ok "post-tool validation recovery passes through with a missing policy dependency (status $forced_validation_missing_policy_status)"
+  sed 's/^/  stdout: /' "$OUT"
   sed 's/^/  stderr: /' "$ERR"
 fi
 
@@ -1402,6 +2275,43 @@ expect_json_status 2 "env piped to a non-listed sink (gzip) is blocked" \
 expect_json_status 0 "env VAR=x cmd piped (wrapped command, not bare env) is allowed" \
   '{"tool_name":"Bash","tool_input":{"command":"env FOO=bar printf %s done | cat"}}' \
   hook-pre-tool
+
+# Bash provides one opaque command string, so source/search operands that look
+# like protected paths stay blocked. These policy-only fixtures verify both the
+# actionable diagnosis and the supported structured/script alternatives; none
+# of the embedded commands is executed.
+ambiguous_bash_fixtures="$ROOT/tests/fixtures/ambiguous-bash-protected-path.json"
+ambiguous_bash_cases="$TESTTMP/ambiguous-bash-protected-path.cases"
+if jq -e 'type == "array" and length > 0' "$ambiguous_bash_fixtures" >/dev/null \
+  && jq -c '.[]' "$ambiguous_bash_fixtures" >"$ambiguous_bash_cases"; then
+  ok "ambiguous Bash protected-path fixture corpus is valid and non-empty"
+else
+  not_ok "ambiguous Bash protected-path fixture corpus is valid and non-empty"
+fi
+while IFS= read -r ambiguous_bash_fixture; do
+  ambiguous_bash_description=$(printf '%s' "$ambiguous_bash_fixture" \
+    | jq -r '.classification + ": " + .description')
+  expect_json_status "$(printf '%s' "$ambiguous_bash_fixture" | jq -r '.expected_status')" \
+    "$ambiguous_bash_description" \
+    "$(printf '%s' "$ambiguous_bash_fixture" | jq -c '.event')" \
+    hook-pre-tool
+
+  ambiguous_bash_reason=$(printf '%s' "$ambiguous_bash_fixture" \
+    | jq -r '.expected_reason // empty')
+  if [ -n "$ambiguous_bash_reason" ]; then
+    if grep -Fq "reason=$ambiguous_bash_reason" "$ERR"; then
+      ok "$ambiguous_bash_description emits a stable reason"
+    else
+      not_ok "$ambiguous_bash_description emits a stable reason"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  elif grep -Fq 'reason=bash_protected_path_text_match' "$ERR"; then
+    not_ok "$ambiguous_bash_description does not emit the Bash path-text reason"
+    sed 's/^/  stderr: /' "$ERR"
+  else
+    ok "$ambiguous_bash_description does not emit the Bash path-text reason"
+  fi
+done <"$ambiguous_bash_cases"
 
 # Rank 7: allow explicitly named environment templates, but never a real env
 # file.
@@ -2434,6 +3344,28 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+# mask mode fails closed: a Tier-2 detector that errors blocks even clean input.
+# The stub fails only the gate's own awk program, so the dependency checks stay
+# green and this isolates block_on_pii_text from an infra-degraded exit.
+if [ -x /usr/bin/awk ]; then
+  PII_STUB_BIN="$TMP_ROOT/pii-stub-bin"
+  mkdir -p "$PII_STUB_BIN"
+  printf '%s\n' '#!/bin/sh' 'for a in "$@"; do' \
+    '  case $a in *mask_tier2*) exit 3 ;; esac' 'done' \
+    'exec /usr/bin/awk "$@"' > "$PII_STUB_BIN/awk"
+  chmod +x "$PII_STUB_BIN/awk"
+  printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"note.txt","content":"clean"}}' \
+    | PATH="$PII_STUB_BIN:$PATH" AGENT_GUARD_PII_HOOK_MODE=mask \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 2 ] && grep -q 'Tier-2 PII detector failed' "$ERR"; then
+    ok "PII mask mode fails closed when the Tier-2 detector errors"
+  else
+    not_ok "PII mask mode fails closed when the Tier-2 detector errors (expected 2, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+fi
+
 TEST_REPO="$TMP_ROOT/repo"
 mkdir -p "$TEST_REPO"
 (
@@ -3049,6 +3981,9 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+run_expect 0 "Action installer preserves status and cleans temporary downloads" \
+  sh "$ROOT/tests/action-temp-cleanup.sh"
+
 # action.yml shell-injection regression for AGENT_GUARD_PATHS.
 INJECTION_CANARY="$TMP_ROOT/inject-canary"
 rm -f "$INJECTION_CANARY"
@@ -3091,6 +4026,25 @@ else
 fi
 
 run_expect 0 "check passes when deps and configs exist" "$PLUGIN_ROOT/bin/agent-guard" check
+
+OLD_GITLEAKS="$TESTTMP/gitleaks-old"
+cat >"$OLD_GITLEAKS" <<'STUB'
+#!/usr/bin/env sh
+case "${1:-}" in
+  version) printf '%s\n' 'gitleaks version 7.6.1' ;;
+  *) exit 2 ;;
+esac
+STUB
+chmod +x "$OLD_GITLEAKS"
+run_expect 2 "check rejects an incompatible gitleaks version" \
+  env AGENT_GUARD_GITLEAKS_BIN="$OLD_GITLEAKS" \
+  "$PLUGIN_ROOT/bin/agent-guard" check
+if grep -q 'required >= 8.30.0' "$ERR"; then
+  ok "incompatible gitleaks error reports the required version"
+else
+  not_ok "incompatible gitleaks error reports the required version"
+  sed 's/^/  stderr: /' "$ERR"
+fi
 
 # --- pii-filter -----------------------------------------------------------
 
@@ -3158,7 +4112,7 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
-if grep -q 'expected regex or http' "$ERR"; then
+if grep -q 'expected regex, http, or pleno' "$ERR"; then
   ok "pii-filter provider error lists the accepted values"
 else
   not_ok "pii-filter provider error lists the accepted values"
@@ -3192,7 +4146,7 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
-if "$PLUGIN_ROOT/bin/agent-guard" pii-filter --help 2>&1 | grep -q 'AGENT_GUARD_PII_PROVIDER=regex|http'; then
+if "$PLUGIN_ROOT/bin/agent-guard" pii-filter --help 2>&1 | grep -q 'AGENT_GUARD_PII_PROVIDER=regex|http|pleno'; then
   ok "pii-filter help lists the accepted values"
 else
   not_ok "pii-filter help lists the accepted values"
@@ -3207,6 +4161,7 @@ fi
 PII_MOCK_CURL_DIR="$TMP_ROOT/pii-curl-bin"
 PII_REQUEST_FILE="$TMP_ROOT/pii-request.json"
 PII_URL_FILE="$TMP_ROOT/pii-url.txt"
+PII_TIMEOUT_FILE="$TMP_ROOT/pii-timeout.txt"
 mkdir -p "$PII_MOCK_CURL_DIR"
 cat > "$PII_MOCK_CURL_DIR/curl" <<'EOSH'
 #!/usr/bin/env sh
@@ -3219,6 +4174,12 @@ if [ -n "${PII_MOCK_CURL_URL:-}" ]; then
 fi
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --max-time)
+      shift
+      if [ -n "${PII_MOCK_CURL_TIMEOUT:-}" ]; then
+        printf '%s\n' "${1:-}" >"$PII_MOCK_CURL_TIMEOUT"
+      fi
+      ;;
     -d|--data|--data-raw|--data-binary)
       shift
       if [ "${1:-}" = "@-" ]; then
@@ -3232,9 +4193,19 @@ done
 case "${PII_MOCK_CURL_MODE:-ok}" in
   ok) printf '%s\n' '{"redacted_text":"masked by endpoint"}' ;;
   data) printf '%s\n' '{"data":{"redacted_text":"masked by nested endpoint"}}' ;;
+  pleno) printf '%s\n' '{"text":"masked by pleno","items":["replace"]}' ;;
+  empty) printf '%s\n' '{"text":""}' ;;
+  empty-response) : ;;
+  multi) printf '%s\n' '{"text":"first"}' '{"text":"second"}' ;;
+  valid-bad-json) printf '%s\n' '{"text":"first"}' 'not json' ;;
+  wrong-type) printf '%s\n' '[]' ;;
+  exact) printf '%s\n' '{"text":"exact"}' ;;
+  exact-newline) printf '%s\n' '{"text":"exact\n"}' ;;
   bad-json) printf '%s\n' 'not json' ;;
   bad-response) printf '%s\n' '{"unexpected":"value"}' ;;
   fail) printf '%s\n' 'synthetic curl failure' >&2; exit 7 ;;
+  leak-fail) printf '%s\n' 'remote error contains SYNTHETIC_REMOTE_QA_SENTINEL' >&2; exit 22 ;;
+  timeout) printf '%s\n' 'synthetic timeout' >&2; exit 28 ;;
 esac
 EOSH
 chmod +x "$PII_MOCK_CURL_DIR/curl"
@@ -3314,6 +4285,284 @@ if [ "$(cat "$PII_URL_FILE")" = "http://127.0.0.1:8080/api/redact" ]; then
   ok "pii-filter endpoint adapter uses AGENT_GUARD_PII_REDACT_URL"
 else
   not_ok "pii-filter endpoint adapter uses AGENT_GUARD_PII_REDACT_URL"
+fi
+
+rm -f "$PII_REQUEST_FILE" "$PII_TIMEOUT_FILE"
+printf '%s' 'Contact Alice at alice@example.com' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_REQUEST="$PII_REQUEST_FILE" \
+    PII_MOCK_CURL_TIMEOUT="$PII_TIMEOUT_FILE" \
+    PII_MOCK_CURL_MODE=pleno \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ] && [ "$(cat "$OUT")" = 'masked by pleno' ]; then
+  ok "pii-filter pleno provider uses the verified text response"
+else
+  not_ok "pii-filter pleno provider uses the verified text response (status $status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+if jq -e \
+  '.text == "Contact Alice at alice@example.com" and .language == "en" and (keys | sort) == ["language", "text"]' \
+  "$PII_REQUEST_FILE" >/dev/null 2>&1; then
+  ok "pii-filter pleno provider sends text and explicit default language"
+else
+  not_ok "pii-filter pleno provider sends the verified request shape"
+  sed 's/^/  request: /' "$PII_REQUEST_FILE"
+fi
+if [ "$(cat "$PII_TIMEOUT_FILE")" = '30' ]; then
+  ok "pii-filter endpoint adapter applies a bounded default timeout"
+else
+  not_ok "pii-filter endpoint adapter applies a bounded default timeout"
+fi
+
+printf '%s' '山田太郎のメールはtaro@example.jpです' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_LANGUAGE=ja \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_REQUEST="$PII_REQUEST_FILE" \
+    PII_MOCK_CURL_MODE=pleno \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ] && jq -e '.language == "ja"' "$PII_REQUEST_FILE" >/dev/null 2>&1; then
+  ok "pii-filter pleno provider accepts explicit Japanese language"
+else
+  not_ok "pii-filter pleno provider accepts explicit Japanese language (status $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+rm -f "$PII_URL_FILE"
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_LANGUAGE=ko \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_URL="$PII_URL_FILE" \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && [ ! -s "$OUT" ] && [ ! -e "$PII_URL_FILE" ]; then
+  ok "pii-filter pleno provider rejects invalid language before network access"
+else
+  not_ok "pii-filter pleno provider rejects invalid language before network access (expected 2, got $status)"
+fi
+
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_MODE=empty \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ] && [ "$(cat "$OUT")" = '' ]; then
+  ok "pii-filter pleno provider accepts an empty string response"
+else
+  not_ok "pii-filter pleno provider accepts an empty string response (status $status)"
+fi
+
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_MODE=ok \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && [ ! -s "$OUT" ]; then
+  ok "pii-filter pleno provider rejects generic http response aliases"
+else
+  not_ok "pii-filter pleno provider rejects generic http response aliases (expected 2, got $status)"
+fi
+
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_MODE=bad-json \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && [ ! -s "$OUT" ]; then
+  ok "pii-filter pleno provider fails closed on malformed JSON"
+else
+  not_ok "pii-filter pleno provider fails closed on malformed JSON (expected 2, got $status)"
+fi
+
+for provider in http pleno; do
+  for mode in empty-response multi valid-bad-json wrong-type; do
+    printf '%s' 'x' \
+      | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+        AGENT_GUARD_PII_PROVIDER="$provider" \
+        AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+        PII_MOCK_CURL_MODE="$mode" \
+        "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+        >"$OUT" 2>"$ERR"
+    status=$?
+    if [ "$status" -eq 2 ] && [ ! -s "$OUT" ]; then
+      ok "pii-filter $provider provider fails closed without partial output on $mode response"
+    else
+      not_ok "pii-filter $provider provider fails closed without partial output on $mode response (expected 2, got $status)"
+      sed 's/^/  stdout: /' "$OUT"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+done
+
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=http \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_MODE=empty \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ] && [ "$(cat "$OUT")" = '' ]; then
+  ok "pii-filter http provider accepts an empty string response"
+else
+  not_ok "pii-filter http provider accepts an empty string response (status $status)"
+fi
+
+PII_EXACT_FILE="$TMP_ROOT/pii-exact.txt"
+for provider in http pleno; do
+  for mode in exact exact-newline; do
+    if [ "$mode" = exact ]; then
+      printf '%s' 'exact' >"$PII_EXACT_FILE"
+    else
+      printf 'exact\n' >"$PII_EXACT_FILE"
+    fi
+    printf '%s' 'x' \
+      | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+        AGENT_GUARD_PII_PROVIDER="$provider" \
+        AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+        PII_MOCK_CURL_MODE="$mode" \
+        "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+        >"$OUT" 2>"$ERR"
+    status=$?
+    if [ "$status" -eq 0 ] && cmp -s "$OUT" "$PII_EXACT_FILE"; then
+      ok "pii-filter $provider provider preserves exact response bytes for $mode text"
+    else
+      not_ok "pii-filter $provider provider preserves exact response bytes for $mode text (status $status)"
+    fi
+  done
+done
+
+PATH="$PII_MOCK_CURL_DIR:$PATH" \
+  AGENT_GUARD_PII_PROVIDER=pleno \
+  AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+  PII_MOCK_CURL_MODE=pleno \
+  "$PLUGIN_ROOT/bin/agent-guard" pii-filter --check \
+  >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ]; then
+  ok "pii-filter pleno provider passes endpoint check"
+else
+  not_ok "pii-filter pleno provider passes endpoint check (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"note.txt","content":"Contact Alice"}}' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_HOOK_MODE=block \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_TIMEOUT_SECONDS=30 \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_TIMEOUT="$PII_TIMEOUT_FILE" \
+    PII_MOCK_CURL_MODE=pleno \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'blocked PII' "$ERR"; then
+  ok "PII hook block mode uses the pleno provider"
+else
+  not_ok "PII hook block mode uses the pleno provider (expected 2, got $status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+if [ "$(cat "$PII_TIMEOUT_FILE")" = 5 ]; then
+  ok "PII hook endpoint request is capped below the host timeout"
+else
+  not_ok "PII hook endpoint request is capped below the host timeout"
+fi
+
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_TIMEOUT_SECONDS=1 \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_MODE=timeout \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && [ ! -s "$OUT" ]; then
+  ok "pii-filter pleno provider fails closed on timeout"
+else
+  not_ok "pii-filter pleno provider fails closed on timeout (expected 2, got $status)"
+fi
+
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_MODE=fail \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && [ ! -s "$OUT" ]; then
+  ok "pii-filter pleno provider fails closed on HTTP failure"
+else
+  not_ok "pii-filter pleno provider fails closed on HTTP failure (expected 2, got $status)"
+fi
+
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_REDACT_URL='https://user:SYNTHETIC_URL_QA_SENTINEL@example.invalid/api/redact?key=SYNTHETIC_URL_QA_SENTINEL' \
+    PII_MOCK_CURL_MODE=leak-fail \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] \
+  && [ ! -s "$OUT" ] \
+  && grep -q 'pleno provider request failed' "$ERR" \
+  && ! grep -q 'SYNTHETIC_.*_QA_SENTINEL' "$ERR"; then
+  ok "pii-filter endpoint failure hides URL credentials and remote stderr"
+else
+  not_ok "pii-filter endpoint failure hides URL credentials and remote stderr (expected 2, got $status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s' 'x' \
+  | env -u AGENT_GUARD_PII_REDACT_URL AGENT_GUARD_PII_PROVIDER=pleno \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && [ ! -s "$OUT" ]; then
+  ok "pii-filter pleno provider fails closed when URL is missing"
+else
+  not_ok "pii-filter pleno provider fails closed when URL is missing (expected 2, got $status)"
+fi
+
+rm -f "$PII_URL_FILE"
+printf '%s' 'x' \
+  | PATH="$PII_MOCK_CURL_DIR:$PATH" \
+    AGENT_GUARD_PII_PROVIDER=pleno \
+    AGENT_GUARD_PII_TIMEOUT_SECONDS=0 \
+    AGENT_GUARD_PII_REDACT_URL='http://127.0.0.1:8080/api/redact' \
+    PII_MOCK_CURL_URL="$PII_URL_FILE" \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+    >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && [ ! -s "$OUT" ] && [ ! -e "$PII_URL_FILE" ]; then
+  ok "pii-filter pleno provider rejects invalid timeout before network access"
+else
+  not_ok "pii-filter pleno provider rejects invalid timeout before network access (expected 2, got $status)"
 fi
 
 PATH="$PII_MOCK_CURL_DIR:$PATH" \
@@ -3623,6 +4872,220 @@ else
 fi
 rm -f "$POST_REPO/root-leak.txt"
 
+# --- PostToolUse scans the path this tool call actually wrote --------------
+# `git diff` and `git ls-files --others --exclude-standard` both skip ignored
+# paths, and neither reaches past the repository boundary, so the working-tree
+# backstop never looked at either write. PostToolUse knows the path the tool
+# just wrote, so exactly that one file is scanned directly.
+
+IGN_REPO="$TMP_ROOT/vcs-skipped-repo"
+OUTSIDE_DIR="$TMP_ROOT/outside-any-repo"
+mkdir -p "$IGN_REPO/vault" "$OUTSIDE_DIR"
+(
+  cd "$IGN_REPO" || exit 2
+  git init -q
+  git config user.email t@e
+  git config user.name t
+  printf '%s\n' "vault/" > .gitignore
+  printf '%s\n' "ok" > README.md
+  git add .gitignore README.md
+  git commit -q -m init
+)
+
+post_target_status() {  # $1 = session id, $2 = tool JSON, $3 = cwd
+  printf '%s' "$2" \
+    | jq -c --arg s "$1" --arg d "$3" '. + {session_id:$s, cwd:$d}' \
+    | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+}
+
+expect_post_target() {  # $1 = expected status, $2 = name, $3 = session, $4 = JSON, $5 = cwd
+  post_target_status "$3" "$4" "$5"
+  status=$?
+  if [ "$status" -eq "$1" ]; then
+    ok "$2"
+  else
+    not_ok "$2 (expected $1, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+}
+
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$IGN_REPO/vault/creds.txt"
+expect_post_target 2 "hook-post-tool blocks a Write to a path git skips" \
+  vcs-skipped-secret \
+  '{"tool_name":"Write","tool_input":{"file_path":"vault/creds.txt"}}' "$IGN_REPO"
+
+printf '%s\n' "port = 8080" >"$IGN_REPO/vault/settings.txt"
+expect_post_target 0 "hook-post-tool allows a clean Write to a path git skips" \
+  vcs-skipped-clean \
+  '{"tool_name":"Write","tool_input":{"file_path":"vault/settings.txt"}}' "$IGN_REPO"
+
+# The marginal case the working-tree backstop cannot reach at all: the Edit
+# fragment itself was clean, but the file it landed in is not.
+expect_post_target 2 "hook-post-tool blocks an Edit whose skipped target file holds a secret" \
+  vcs-skipped-edit \
+  '{"tool_name":"Edit","tool_input":{"file_path":"vault/creds.txt","new_string":"port = 8080"}}' \
+  "$IGN_REPO"
+
+# A tracked, non-ignored file stays on the existing working-tree path: the
+# whole file is not re-scanned, so committed content is not re-reported.
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$IGN_REPO/legacy.txt"
+(
+  cd "$IGN_REPO" || exit 2
+  git add legacy.txt
+  git commit -q -m legacy
+)
+expect_post_target 0 "hook-post-tool leaves committed tracked content to the working-tree backstop" \
+  vcs-tracked-committed \
+  '{"tool_name":"Write","tool_input":{"file_path":"legacy.txt"}}' "$IGN_REPO"
+
+# `git update-index --skip-worktree` / `--assume-unchanged` make `git diff HEAD`
+# report nothing for the path while `check-ignore` still calls it not-ignored.
+# Judging coverage by ignore status alone left these tracked-but-index-excluded
+# files scanned by neither backstop.
+(
+  cd "$IGN_REPO" || exit 2
+  printf '%s\n' "port = 8080" > skipped-conf.txt
+  printf '%s\n' "port = 8080" > assumed-conf.txt
+  printf '%s\n' "port = 8080" > skipped-clean.txt
+  printf '%s\n' "port = 8080" > assumed-clean.txt
+  git add skipped-conf.txt assumed-conf.txt skipped-clean.txt assumed-clean.txt
+  git commit -q -m index-excluded
+  git update-index --skip-worktree skipped-conf.txt skipped-clean.txt
+  git update-index --assume-unchanged assumed-conf.txt assumed-clean.txt
+)
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$IGN_REPO/skipped-conf.txt"
+expect_post_target 2 "hook-post-tool blocks an Edit to a skip-worktree tracked file" \
+  vcs-skip-worktree-secret \
+  '{"tool_name":"Edit","tool_input":{"file_path":"skipped-conf.txt"}}' "$IGN_REPO"
+
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$IGN_REPO/assumed-conf.txt"
+expect_post_target 2 "hook-post-tool blocks an Edit to an assume-unchanged tracked file" \
+  vcs-assume-unchanged-secret \
+  '{"tool_name":"Edit","tool_input":{"file_path":"assumed-conf.txt"}}' "$IGN_REPO"
+
+printf '%s\n' "timeout = 30" >"$IGN_REPO/skipped-clean.txt"
+expect_post_target 0 "hook-post-tool allows a clean Edit to a skip-worktree tracked file" \
+  vcs-skip-worktree-clean \
+  '{"tool_name":"Edit","tool_input":{"file_path":"skipped-clean.txt"}}' "$IGN_REPO"
+
+printf '%s\n' "timeout = 30" >"$IGN_REPO/assumed-clean.txt"
+expect_post_target 0 "hook-post-tool allows a clean Edit to an assume-unchanged tracked file" \
+  vcs-assume-unchanged-clean \
+  '{"tool_name":"Edit","tool_input":{"file_path":"assumed-clean.txt"}}' "$IGN_REPO"
+
+# A tracked file that also matches .gitignore stays on the working-tree path:
+# `git diff HEAD` reports tracked paths whatever the ignore rules say, so the
+# direct scan must not duplicate it — and the secret must not be lost either.
+(
+  cd "$IGN_REPO" || exit 2
+  printf '%s\n' "port = 8080" > vault/tracked.txt
+  git add -f vault/tracked.txt
+  git commit -q -m tracked-ignored
+)
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$IGN_REPO/vault/tracked.txt"
+expect_post_target 2 "hook-post-tool still catches a tracked file that matches .gitignore" \
+  vcs-tracked-ignored-secret \
+  '{"tool_name":"Edit","tool_input":{"file_path":"vault/tracked.txt"}}' "$IGN_REPO"
+# The two backstops report under different names and the working-tree one exits
+# first, so its message is proof the tracked path was not rescanned directly.
+if grep -q 'changed files contain secret-like values' "$ERR"; then
+  ok "hook-post-tool leaves a tracked ignored file to the working-tree backstop"
+else
+  not_ok "hook-post-tool leaves a tracked ignored file to the working-tree backstop"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+printf '%s\n' "port = 8080" >"$IGN_REPO/vault/tracked.txt"
+
+# A symlink inside a skipped directory must not launder the target.
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$OUTSIDE_DIR/linked-secret.txt"
+ln -sf "$OUTSIDE_DIR/linked-secret.txt" "$IGN_REPO/vault/link.txt"
+expect_post_target 2 "hook-post-tool follows a symlink out of a skipped directory" \
+  vcs-skipped-symlink \
+  '{"tool_name":"Write","tool_input":{"file_path":"vault/link.txt"}}' "$IGN_REPO"
+
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$OUTSIDE_DIR/leak.txt"
+expect_post_target 2 "hook-post-tool blocks a Write outside any git repository" \
+  outside-repo-secret \
+  "$(jq -nc --arg p "$OUTSIDE_DIR/leak.txt" \
+      '{tool_name:"Write",tool_input:{file_path:$p}}')" "$OUTSIDE_DIR"
+
+printf '%s\n' "port = 8080" >"$OUTSIDE_DIR/clean.txt"
+expect_post_target 0 "hook-post-tool allows a clean Write outside any git repository" \
+  outside-repo-clean \
+  "$(jq -nc --arg p "$OUTSIDE_DIR/clean.txt" \
+      '{tool_name:"Write",tool_input:{file_path:$p}}')" "$OUTSIDE_DIR"
+
+# A write into a *different* repository is outside the scanned work tree too.
+OTHER_REPO="$TMP_ROOT/other-repo"
+mkdir -p "$OTHER_REPO"
+(
+  cd "$OTHER_REPO" || exit 2
+  git init -q
+  git config user.email t@e
+  git config user.name t
+)
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$OTHER_REPO/leak.txt"
+expect_post_target 2 "hook-post-tool blocks a Write into a different repository" \
+  other-repo-secret \
+  "$(jq -nc --arg p "$OTHER_REPO/leak.txt" \
+      '{tool_name:"Write",tool_input:{file_path:$p}}')" "$IGN_REPO"
+
+# A path the tool never created, and a non-regular target, stay silent.
+(
+  cd "$OUTSIDE_DIR" || exit 2
+  printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"never-written.txt"}}' \
+    | "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] && [ ! -s "$ERR" ]; then
+  ok "hook-post-tool stays silent when the written path does not exist"
+else
+  not_ok "hook-post-tool stays silent for a missing written path (expected 0 + empty stderr, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+ln -sf /dev/null "$OUTSIDE_DIR/device-link.txt"
+expect_post_target 0 "hook-post-tool skips a written path that is not a regular file" \
+  outside-repo-device \
+  "$(jq -nc --arg p "$OUTSIDE_DIR/device-link.txt" \
+      '{tool_name:"Write",tool_input:{file_path:$p}}')" "$OUTSIDE_DIR"
+
+# An unscannable target is an infrastructure failure, not a pass: it follows
+# AGENT_GUARD_INFRA_FAILURE_MODE like every other scanner outage.
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" >"$OUTSIDE_DIR/unreadable.txt"
+chmod 000 "$OUTSIDE_DIR/unreadable.txt"
+if [ -r "$OUTSIDE_DIR/unreadable.txt" ]; then
+  say "# skipping unreadable written-path policy checks (file stayed readable)"
+else
+  unreadable_json=$(jq -nc --arg p "$OUTSIDE_DIR/unreadable.txt" --arg d "$OUTSIDE_DIR" \
+    '{session_id:"unreadable-open",tool_name:"Write",tool_input:{file_path:$p},cwd:$d}')
+  printf '%s' "$unreadable_json" \
+    | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=open \
+        AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 0 ] && grep -q 'AGENT_GUARD_INFRA_FAILURE_MODE=open' "$ERR"; then
+    ok "hook-post-tool continues on an unscannable written path when the policy is open"
+  else
+    not_ok "hook-post-tool open policy on an unscannable written path (expected 0 + notice, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+  printf '%s' "$unreadable_json" \
+    | jq -c '.session_id = "unreadable-closed"' \
+    | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+        AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 2 ]; then
+    ok "hook-post-tool blocks an unscannable written path when the policy is closed"
+  else
+    not_ok "hook-post-tool closed policy on an unscannable written path (expected 2, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+  chmod 644 "$OUTSIDE_DIR/unreadable.txt"
+fi
+
 # A failed git diff means the scanner did not run. Direct scan commands expose
 # status 3 so hook callers can apply the configured infrastructure policy.
 DIFF_FAIL_BIN="$TESTTMP/diff-fail-bin"
@@ -3663,7 +5126,7 @@ fi
 NO_GIT_BIN="$TESTTMP/no-git-bin"
 NO_GIT_WARN_DIR="$TESTTMP/no-git-warnings"
 mkdir -p "$NO_GIT_BIN" "$NO_GIT_WARN_DIR"
-for no_git_cmd in sh dirname pwd readlink jq sed awk grep cat mktemp mkdir chmod rm sort tail cut head; do
+for no_git_cmd in sh dirname pwd readlink jq sed awk grep cat mktemp mkdir rmdir chmod rm sort tail cut head sleep wc tr setsid perl; do
   no_git_path=$(command -v "$no_git_cmd" 2>/dev/null || true)
   [ -n "$no_git_path" ] && ln -s "$no_git_path" "$NO_GIT_BIN/$no_git_cmd"
 done
@@ -4002,6 +5465,10 @@ ERROR_BIN="$TMP_ROOT/error-bin"
 mkdir -p "$ERROR_BIN"
 cat > "$ERROR_BIN/gitleaks" <<'EOSH'
 #!/usr/bin/env sh
+if [ "${1:-}" = version ]; then
+  printf '%s\n' '8.30.1-error-fixture'
+  exit 0
+fi
 echo "synthetic gitleaks failure" >&2
 exit 3
 EOSH
@@ -4020,6 +5487,10 @@ ERROR_ZERO_BIN="$TMP_ROOT/error-zero-bin"
 mkdir -p "$ERROR_ZERO_BIN"
 cat > "$ERROR_ZERO_BIN/gitleaks" <<'EOSH'
 #!/usr/bin/env sh
+if [ "${1:-}" = version ]; then
+  printf '%s\n' '8.30.1-error-zero-fixture'
+  exit 0
+fi
 echo "ERR skipping file: synthetic unreadable fixture" >&2
 exit 0
 EOSH
@@ -4247,14 +5718,27 @@ mkdir -p "$NO_GITLEAKS_BIN"
 ln -s "$REAL_SH" "$NO_GITLEAKS_BIN/sh"
 ln -s "$REAL_DIRNAME" "$NO_GITLEAKS_BIN/dirname"
 ln -s "$REAL_PWD" "$NO_GITLEAKS_BIN/pwd"
+ln -s "$(command -v awk)" "$NO_GITLEAKS_BIN/awk"
+for no_gitleaks_tool in sleep wc tr rm mkdir rmdir setsid perl; do
+  no_gitleaks_tool_path=$(command -v "$no_gitleaks_tool" 2>/dev/null || :)
+  [ -n "$no_gitleaks_tool_path" ] \
+    && ln -s "$no_gitleaks_tool_path" "$NO_GITLEAKS_BIN/$no_gitleaks_tool"
+done
 AGENT_GUARD_GITLEAKS_BIN=/nonexistent/gitleaks PATH="$NO_GITLEAKS_BIN" \
   "$PLUGIN_ROOT/bin/agent-guard" scan-path "$CLEAN_DIR" >"$OUT" 2>"$ERR"
 status=$?
-if [ "$status" -eq 2 ]; then
-  ok "scan-path dies when gitleaks is unavailable"
+if [ "$status" -eq 3 ]; then
+  ok "scan-path reports unavailable when gitleaks is missing"
 else
-  not_ok "scan-path dies when gitleaks is unavailable (expected 2, got $status)"
+  not_ok "scan-path reports unavailable when gitleaks is missing (expected 3, got $status)"
 fi
+
+run_expect 0 "direct scan dependency statuses and recovery" \
+  "$REAL_SH" "$ROOT/tests/direct-scan-status.sh"
+run_expect 0 "deterministic gitleaks resolution and capability diagnostics" \
+  "$REAL_SH" "$ROOT/tests/gitleaks-resolution.sh"
+run_expect 0 "setup and manifest hook outcome contracts" \
+  "$REAL_SH" "$ROOT/tests/hook-outcome-contract.sh"
 
 # Reuse NO_GITLEAKS_BIN: jq must remain reachable so setup can report jq ok
 # while gitleaks is missing.
@@ -4283,6 +5767,23 @@ else
   not_ok "setup --install without --gitleaks-checksum exits 2 (expected 2, got $status)"
   sed 's/^/  stderr: /' "$ERR"
 fi
+
+# setup is a readiness command, so a missing git executable must affect its
+# status even when jq and a compatible gitleaks are already present. The
+# --install path must not report success merely because no gitleaks download is
+# needed.
+NO_GIT_BIN="$TMP_ROOT/no-git-bin"
+mkdir -p "$NO_GIT_BIN"
+for no_git_tool in sh dirname pwd jq head awk mktemp sleep wc tr rm mkdir rmdir setsid perl; do
+  no_git_tool_path=$(command -v "$no_git_tool" 2>/dev/null || :)
+  [ -n "$no_git_tool_path" ] && ln -s "$no_git_tool_path" "$NO_GIT_BIN/$no_git_tool"
+done
+run_expect 1 "setup exits 1 when git is missing" \
+  env PATH="$NO_GIT_BIN" AGENT_GUARD_GITLEAKS_BIN="$MOCK_BIN/gitleaks" \
+  "$PLUGIN_ROOT/bin/agent-guard" setup
+run_expect 1 "setup --install still exits 1 when git is missing" \
+  env PATH="$NO_GIT_BIN" AGENT_GUARD_GITLEAKS_BIN="$MOCK_BIN/gitleaks" \
+  "$PLUGIN_ROOT/bin/agent-guard" setup --install
 
 DEGRADED_WARNING_DIR="$TESTTMP/degraded-warnings"
 mkdir -p "$DEGRADED_WARNING_DIR"
@@ -4358,6 +5859,138 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+# Malformed hook input is hostile input, not a scanner outage. jq can still
+# reject it before an unrelated missing scanner or policy takes the default
+# open path, and that rejection must remain visible on every event.
+for malformed_missing_case in \
+  'hook-pre-tool:PreToolUse' \
+  'hook-post-tool:PostToolUse' \
+  'hook-stop:Stop'; do
+  malformed_missing_cmd=${malformed_missing_case%%:*}
+  malformed_missing_event=${malformed_missing_case#*:}
+  for malformed_missing_attempt in 1 2; do
+    printf '%s' '{broken-json' \
+      | AGENT_GUARD_GITLEAKS_BIN=/nonexistent/gitleaks \
+        AGENT_GUARD_INFRA_FAILURE_MODE=open \
+        AGENT_GUARD_SESSION_ID=malformed-missing-repeat \
+        AGENT_GUARD_WARNING_DIR="$TESTTMP/malformed-missing-repeat" \
+        PATH="$NO_GITLEAKS_BIN" \
+        "$PLUGIN_ROOT/bin/agent-guard" "$malformed_missing_cmd" >"$OUT" 2>"$ERR"
+    malformed_missing_status=$?
+    if [ "$malformed_missing_status" -eq 2 ] && [ ! -s "$OUT" ] \
+       && grep -q "$malformed_missing_event hook input was not a JSON object" "$ERR"; then
+      ok "$malformed_missing_cmd validates before missing gitleaks attempt $malformed_missing_attempt"
+    else
+      not_ok "$malformed_missing_cmd passes malformed input through missing gitleaks attempt $malformed_missing_attempt (status $malformed_missing_status)"
+      sed 's/^/  stdout: /' "$OUT"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+done
+
+printf '%s' '[]' \
+  | AGENT_GUARD_DENY_READ_PATHS="$TESTTMP/missing-deny-read-policy" \
+    AGENT_GUARD_INFRA_FAILURE_MODE=open \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+missing_policy_malformed_status=$?
+if [ "$missing_policy_malformed_status" -eq 2 ] && [ ! -s "$OUT" ] \
+   && grep -q 'PostToolUse hook input was not a JSON object' "$ERR"; then
+  ok "post-tool validates malformed input before a missing policy file"
+else
+  not_ok "post-tool passes malformed input through a missing policy file (status $missing_policy_malformed_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s' '{"session_id":"valid-missing-policy","tool_name":"Read","tool_input":{}}' \
+  | AGENT_GUARD_DENY_READ_PATHS="$TESTTMP/missing-deny-read-policy" \
+    AGENT_GUARD_INFRA_FAILURE_MODE=open \
+    AGENT_GUARD_WARNING_DIR="$TESTTMP/valid-missing-policy-warning" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+valid_missing_policy_status=$?
+if [ "$valid_missing_policy_status" -eq 0 ] \
+   && grep -q 'AGENT_GUARD_INFRA_FAILURE_MODE=open' "$ERR"; then
+  ok "valid hook input with a missing policy still follows degraded-open semantics"
+else
+  not_ok "valid hook input with a missing policy changes degraded-open semantics (status $valid_missing_policy_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+HOOK_NO_JQ_BIN="$TMP_ROOT/hook-no-jq-bin"
+mkdir -p "$HOOK_NO_JQ_BIN"
+for hook_no_jq_tool in sh awk dirname pwd; do
+  ln -s "$(command -v "$hook_no_jq_tool")" "$HOOK_NO_JQ_BIN/$hook_no_jq_tool"
+done
+mkdir -p "$TESTTMP/hook-no-jq-open" "$TESTTMP/hook-no-jq-closed"
+printf '%s' '{broken-json' \
+  | PATH="$HOOK_NO_JQ_BIN" \
+    AGENT_GUARD_INFRA_FAILURE_MODE=open \
+    AGENT_GUARD_SESSION_ID=hook-no-jq-open \
+    AGENT_GUARD_WARNING_DIR="$TESTTMP/hook-no-jq-open" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+hook_no_jq_open_status=$?
+if [ "$hook_no_jq_open_status" -eq 0 ] \
+   && grep -q 'AGENT_GUARD_INFRA_FAILURE_MODE=open' "$ERR"; then
+  ok "jq-missing hook input retains the default degraded-open policy"
+else
+  not_ok "jq-missing hook input changes the default degraded-open policy (status $hook_no_jq_open_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s' '{broken-json' \
+  | PATH="$HOOK_NO_JQ_BIN" \
+    AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+    AGENT_GUARD_SESSION_ID=hook-no-jq-closed \
+    AGENT_GUARD_WARNING_DIR="$TESTTMP/hook-no-jq-closed" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+hook_no_jq_closed_status=$?
+if [ "$hook_no_jq_closed_status" -eq 2 ] \
+   && grep -q 'AGENT_GUARD_INFRA_FAILURE_MODE=closed' "$ERR"; then
+  ok "jq-missing hook input retains the opt-in degraded-closed policy"
+else
+  not_ok "jq-missing hook input changes the opt-in degraded-closed policy (status $hook_no_jq_closed_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+HOOK_NO_AWK_BIN="$TMP_ROOT/hook-no-awk-bin"
+mkdir -p "$HOOK_NO_AWK_BIN" "$TESTTMP/hook-no-awk-open"
+for hook_no_awk_tool in sh jq dirname pwd; do
+  ln -s "$(command -v "$hook_no_awk_tool")" "$HOOK_NO_AWK_BIN/$hook_no_awk_tool"
+done
+printf '%s' '{"session_id":"hook-no-awk","tool_name":"Read","tool_input":{}}' \
+  | PATH="$HOOK_NO_AWK_BIN" \
+    AGENT_GUARD_GITLEAKS_BIN="$MOCK_BIN/gitleaks" \
+    AGENT_GUARD_INFRA_FAILURE_MODE=open \
+    AGENT_GUARD_WARNING_DIR="$TESTTMP/hook-no-awk-open" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+hook_no_awk_status=$?
+if [ "$hook_no_awk_status" -eq 0 ] \
+   && grep -q 'jq, awk, git, gitleaks' "$ERR"; then
+  ok "hook readiness treats the portable fallback awk as a required dependency"
+else
+  not_ok "hook readiness ignores a missing portable fallback awk (status $hook_no_awk_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+INACTIVE_POLICY="$TESTTMP/inactive-deny-read-policy.txt"
+printf ' \r\n\t# interrupted policy extraction\r\n' >"$INACTIVE_POLICY"
+printf '%s' '{"session_id":"inactive-policy","tool_name":"Bash","tool_input":{"command":"echo clean"}}' \
+  | AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+    AGENT_GUARD_DENY_READ_PATHS="$INACTIVE_POLICY" \
+    AGENT_GUARD_GITLEAKS_BIN="$MOCK_BIN/gitleaks" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ]; then
+  ok "hook dependencies reject a policy file with no active rules"
+else
+  not_ok "inactive hook policy follows the closed infrastructure policy (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
 EXEC_NOT_RUN="$TESTTMP/exec-not-run.txt"
 AGENT_GUARD_GITLEAKS_BIN=/nonexistent/gitleaks PATH="$NO_GITLEAKS_BIN" \
   "$PLUGIN_ROOT/bin/agent-guard" exec -- sh -c 'printf ran >"$1"' _ "$EXEC_NOT_RUN" >"$OUT" 2>"$ERR"
@@ -4375,7 +6008,7 @@ chmod +x "$PRIVATE_GL_DIR/gitleaks"
 AGENT_GUARD_GITLEAKS_BIN_DIR="$PRIVATE_GL_DIR" PATH="$NO_GITLEAKS_BIN" \
   "$PLUGIN_ROOT/bin/agent-guard" check >"$OUT" 2>"$ERR"
 status=$?
-if [ "$status" -eq 0 ] && grep -q 'gitleaks 0.0.0-mock' "$ERR"; then
+if [ "$status" -eq 0 ] && grep -q 'gitleaks 8.30.1' "$ERR"; then
   ok "check discovers gitleaks in Agent Guard's private install directory"
 else
   not_ok "check discovers privately installed gitleaks (status $status)"
@@ -4824,10 +6457,46 @@ run_expect 0 "release tarball builder succeeds" \
 tar -xzf "$RELEASE_TARBALL_DIR/agent-guard-test.tar.gz" -C "$RELEASE_TARBALL_DIR/out"
 if [ -x "$RELEASE_TARBALL_DIR/out/bin/agent-guard" ] \
    && [ -x "$RELEASE_TARBALL_DIR/out/install.sh" ] \
-   && [ -f "$RELEASE_TARBALL_DIR/out/deployment/claude-managed-settings.example.json" ]; then
-  ok "release tarball contains the CLI, installer, and managed settings example"
+   && [ -f "$RELEASE_TARBALL_DIR/out/deployment/claude-managed-settings.example.json" ] \
+   && cmp -s "$ROOT/README.md" "$RELEASE_TARBALL_DIR/out/README.md" \
+   && cmp -s "$ROOT/docs/demo.gif" "$RELEASE_TARBALL_DIR/out/docs/demo.gif"; then
+  ok "release tarball contains the CLI, installer, managed settings, and exact consolidated README with demo"
 else
-  not_ok "release tarball contains the CLI, installer, and managed settings example"
+  not_ok "release tarball contains the CLI, installer, managed settings, and exact consolidated README with demo"
+fi
+run_expect 0 "extracted release installer check resolves the archive layout" \
+  sh -c 'cd "$1" && ./install.sh check' _ "$RELEASE_TARBALL_DIR/out"
+
+FORMULA_SHA=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+run_expect 0 "Homebrew formula renderer emits a pinned release" \
+  "$ROOT/scripts/render-homebrew-formula.sh" 3.1.0 "$FORMULA_SHA"
+formula_output=$(
+  "$ROOT/scripts/render-homebrew-formula.sh" 3.1.0 "$FORMULA_SHA"
+)
+if printf '%s\n' "$formula_output" | grep -q 'libexec.install Dir' \
+   && printf '%s\n' "$formula_output" | grep -q 'libexec/".agent-guard-homebrew"' \
+   && printf '%s\n' "$formula_output" | grep -q 'agent-guard-3.1.0.tar.gz' \
+   && printf '%s\n' "$formula_output" | grep -q 'sha256 "'$FORMULA_SHA'"' \
+   && printf '%s\n' "$formula_output" | grep -q 'depends_on "git"' \
+   && printf '%s\n' "$formula_output" | grep -q 'depends_on "gitleaks"' \
+   && printf '%s\n' "$formula_output" | grep -q 'depends_on "jq"' \
+   && printf '%s\n' "$formula_output" | grep -q 'depends_on "perl"' \
+   && printf '%s\n' "$formula_output" | grep -q 'system bin/"agent-guard", "check"' \
+   && printf '%s\n' "$formula_output" | grep -q 'system bin/"agent-guard", "smoke-test"' \
+   && ! printf '%s\n' "$formula_output" | grep -q 'system "#{bin}/agent-guard"'; then
+  ok "Homebrew formula pins release, installs CLI dependencies, and checks the guard"
+else
+  not_ok "Homebrew formula pins release, installs CLI dependencies, and checks the guard"
+fi
+run_expect 2 "Homebrew formula renderer rejects a malformed checksum" \
+  "$ROOT/scripts/render-homebrew-formula.sh" 3.1.0 bad
+run_expect 2 "Homebrew formula renderer rejects a malformed version" \
+  "$ROOT/scripts/render-homebrew-formula.sh" 3.bad.0 "$FORMULA_SHA"
+if grep -q 'render-homebrew-formula.sh.*> agent-guard.rb' "$ROOT/.github/workflows/release.yml" \
+   && [ "$(grep -c 'agent-guard.rb' "$ROOT/.github/workflows/release.yml")" -ge 2 ]; then
+  ok "release workflow generates and uploads the Homebrew formula"
+else
+  not_ok "release workflow generates and uploads the Homebrew formula"
 fi
 
 # --- githooks/pre-commit invokes scan-staged ------------------------------
@@ -4920,6 +6589,258 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+# --- Untracked scan input limit keeps truncation distinct from failures -----
+# `head` closes its input once it captures the sentinel byte. Large producers
+# commonly observe that as SIGPIPE, but the bounded byte count — not that
+# expected producer status — defines the scan result.
+UNTRACKED_LIMIT_REPO="$TMP_ROOT/untracked-limit-repo"
+UNTRACKED_LIMIT_MARKER_PART_1=AGENT_GUARD_TEST_
+UNTRACKED_LIMIT_MARKER_PART_2=SECRET
+UNTRACKED_LIMIT_MARKER=$(printf '%s%s' \
+  "$UNTRACKED_LIMIT_MARKER_PART_1" "$UNTRACKED_LIMIT_MARKER_PART_2")
+mkdir -p "$UNTRACKED_LIMIT_REPO"
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  git init -q
+  git config user.email t@e
+  git config user.name t
+  printf 'clean\n' >README.md
+  git add README.md
+  git commit -q -m init
+  limit_i=0
+  while [ "$limit_i" -lt 100 ]; do
+    limit_i=$((limit_i + 1))
+    awk 'BEGIN { for (i = 0; i < 40000; i++) printf "x" }' \
+      >"oversized-input-$limit_i.txt"
+  done
+  printf '\n%s\n' "$UNTRACKED_LIMIT_MARKER" >>oversized-input-100.txt
+  "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 3 ] \
+   && grep -Eq 'untracked files exceeded the scan input limit of [0-9]+ bytes' "$ERR" \
+   && ! grep -Fq 'failed to prepare untracked files for scanning' "$ERR" \
+   && ! grep -Eq 'SIGPIPE|signal 13|status 13' "$ERR" \
+   && ! grep -Fq 'oversized-input-' "$ERR"; then
+  ok "over-limit untracked input reports the intended secret-safe size diagnostic"
+else
+  not_ok "over-limit untracked input is unavailable without exposing SIGPIPE or paths (expected 3, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# A newline, quote, space, and semicolon in one name lock in the NUL-delimited
+# filename transport. A finding proves the producer did not merely skip the
+# unusual path; replacing it with clean content then covers the below-limit
+# clean result separately.
+limit_i=0
+while [ "$limit_i" -lt 100 ]; do
+  limit_i=$((limit_i + 1))
+  rm -f "$UNTRACKED_LIMIT_REPO/oversized-input-$limit_i.txt"
+done
+UNTRACKED_SPECIAL_NAME=$(printf "line\\nbreak; 'quoted name'.txt")
+printf '%s\n' "$UNTRACKED_LIMIT_MARKER" >"$UNTRACKED_LIMIT_REPO/$UNTRACKED_SPECIAL_NAME"
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 1 ]; then
+  ok "untracked scanning preserves a special filename and detects its finding"
+else
+  not_ok "special-filename untracked input is not skipped (expected 1, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+printf 'clean special file\n' >"$UNTRACKED_LIMIT_REPO/$UNTRACKED_SPECIAL_NAME"
+# Include the per-file separator overhead while staying comfortably below the
+# one-third component cap (3,495,253 bytes).
+awk 'BEGIN { for (i = 0; i < 3200000; i++) printf "x" }' \
+  >"$UNTRACKED_LIMIT_REPO/near-limit-clean.txt"
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ]; then
+  ok "below-limit untracked input scans clean"
+else
+  not_ok "below-limit untracked input scans clean (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# A real file-read failure inside the producer must remain distinguishable from
+# the intentional truncation above. Delegate every unrelated cat invocation so
+# this fixture exercises only the designated untracked path.
+UNTRACKED_FAIL_BIN="$TMP_ROOT/untracked-fail-bin"
+mkdir -p "$UNTRACKED_FAIL_BIN"
+cat >"$UNTRACKED_FAIL_BIN/cat" <<'STUB'
+#!/bin/sh
+if [ "${1:-}" = -- ] && [ "${2:-}" = producer-failure.txt ]; then
+  printf '%s\n' 'synthetic untracked cat failure' >&2
+  exit 71
+fi
+exec "${AGENT_GUARD_TEST_REAL_CAT:?}" "$@"
+STUB
+chmod +x "$UNTRACKED_FAIL_BIN/cat"
+printf 'clean producer fixture\n' >"$UNTRACKED_LIMIT_REPO/producer-failure.txt"
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  PATH="$UNTRACKED_FAIL_BIN:$PATH" AGENT_GUARD_TEST_REAL_CAT="$REAL_CAT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 3 ] \
+   && grep -Fq 'failed to prepare untracked files for scanning' "$ERR" \
+   && ! grep -Fq 'synthetic untracked cat failure' "$ERR" \
+   && ! grep -Fq 'untracked files exceeded the scan input limit' "$ERR"; then
+  ok "genuine untracked file-read failure uses a bounded generic preparation diagnostic"
+else
+  not_ok "genuine untracked file-read failure stays generic and distinct from the size limit (expected 3, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Hook policy still decides what an unavailable scan means. The corrected
+# classification must not change the established open/closed behavior.
+rm -f "$UNTRACKED_LIMIT_REPO/$UNTRACKED_SPECIAL_NAME" \
+  "$UNTRACKED_LIMIT_REPO/near-limit-clean.txt" \
+  "$UNTRACKED_LIMIT_REPO/producer-failure.txt"
+limit_i=0
+while [ "$limit_i" -lt 100 ]; do
+  limit_i=$((limit_i + 1))
+  awk 'BEGIN { for (i = 0; i < 40000; i++) printf "x" }' \
+    >"$UNTRACKED_LIMIT_REPO/oversized-policy-input-$limit_i.txt"
+done
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  printf '%s' '{"session_id":"untracked-limit-open","stop_hook_active":false}' \
+    | AGENT_GUARD_INFRA_FAILURE_MODE=open \
+        AGENT_GUARD_WARNING_DIR="$TESTTMP/untracked-limit-open-warn" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-stop >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] \
+   && grep -Fq 'untracked files exceeded the scan input limit' "$ERR" \
+   && grep -Fq 'AGENT_GUARD_INFRA_FAILURE_MODE=open' "$ERR"; then
+  ok "over-limit untracked input preserves open hook policy"
+else
+  not_ok "over-limit untracked input follows open hook policy (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  printf '%s' '{"session_id":"untracked-limit-closed","stop_hook_active":false}' \
+    | AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+        AGENT_GUARD_WARNING_DIR="$TESTTMP/untracked-limit-closed-warn" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-stop >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 2 ] \
+   && grep -Fq 'untracked files exceeded the scan input limit' "$ERR" \
+   && grep -Fq 'AGENT_GUARD_INFRA_FAILURE_MODE=closed' "$ERR"; then
+  ok "over-limit untracked input preserves closed hook policy"
+else
+  not_ok "over-limit untracked input follows closed hook policy (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# --- git diff scan input limit keeps truncation distinct from failures -----
+# The diff producer is bounded by the same sentinel-byte `head`, so git reports
+# SIGPIPE once the budget is reached. The byte count, not that expected producer
+# status, defines the scan result, and the diagnostic names the budget so the
+# operator can act on it.
+DIFF_LIMIT_REPO="$TMP_ROOT/diff-limit-repo"
+mkdir -p "$DIFF_LIMIT_REPO"
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  git init -q
+  git config user.email t@e
+  git config user.name t
+  printf 'clean\n' >README.md
+  git add README.md
+  git commit -q -m init
+  awk 'BEGIN { for (i = 0; i < 130000; i++) print "oversized-diff-line-payload" }' \
+    >oversized.txt
+  git add oversized.txt
+  "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 3 ] \
+   && grep -Eq 'git diff exceeded the scan input limit of [0-9]+ bytes' "$ERR" \
+   && ! grep -Fq 'git diff failed' "$ERR" \
+   && ! grep -Eq 'SIGPIPE|signal 13|Broken pipe' "$ERR"; then
+  ok "over-limit staged diff reports the scan input limit with its byte budget"
+else
+  not_ok "over-limit staged diff names the size limit instead of a git failure (expected 3, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 3 ] \
+   && grep -Fq 'git diff exceeded the scan input limit' "$ERR" \
+   && ! grep -Fq 'git diff failed' "$ERR"; then
+  ok "over-limit working-tree diff reports the scan input limit"
+else
+  not_ok "over-limit working-tree diff names the size limit instead of a git failure (expected 3, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# A git diff that genuinely fails leaves at most the budget in the stream, so
+# the reordered byte check falls through to the failure diagnostic rather than
+# absorbing it. A failure that arrives only after the budget is already exceeded
+# is reported as a size limit instead; the status is 3 either way, so what the
+# ordering trades is the diagnostic wording, not the outcome.
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  PATH="$DIFF_FAIL_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 3 ] \
+   && grep -Fq 'git diff failed' "$ERR" \
+   && ! grep -Fq 'exceeded the scan input limit' "$ERR"; then
+  ok "genuine git diff failure stays distinct from the scan input limit"
+else
+  not_ok "genuine git diff failure keeps its own diagnostic (expected 3, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Hook policy still decides what an unavailable scan means; the corrected
+# classification must not change the established open/closed behavior.
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  printf '%s' '{"session_id":"diff-limit-open","stop_hook_active":false}' \
+    | AGENT_GUARD_INFRA_FAILURE_MODE=open \
+        AGENT_GUARD_WARNING_DIR="$TESTTMP/diff-limit-open-warn" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-stop >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] \
+   && grep -Fq 'git diff exceeded the scan input limit' "$ERR" \
+   && grep -Fq 'AGENT_GUARD_INFRA_FAILURE_MODE=open' "$ERR"; then
+  ok "over-limit diff preserves open hook policy"
+else
+  not_ok "over-limit diff follows open hook policy (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  printf '%s' '{"session_id":"diff-limit-closed","stop_hook_active":false}' \
+    | AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+        AGENT_GUARD_WARNING_DIR="$TESTTMP/diff-limit-closed-warn" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-stop >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 2 ] \
+   && grep -Fq 'git diff exceeded the scan input limit' "$ERR" \
+   && grep -Fq 'AGENT_GUARD_INFRA_FAILURE_MODE=closed' "$ERR"; then
+  ok "over-limit diff preserves closed hook policy"
+else
+  not_ok "over-limit diff follows closed hook policy (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
 # --- agent-guard check announces gitleaks version ------------------------
 "$PLUGIN_ROOT/bin/agent-guard" check >"$OUT" 2>"$ERR"
 if grep -q 'gitleaks' "$ERR"; then
@@ -4979,7 +6900,7 @@ case "${1:-}" in
     fi
     exit 0
     ;;
-  version) printf '%s\n' '0.0.0-lock-fragment-test' ;;
+  version) printf '%s\n' '8.30.1-lock-fragment-test' ;;
   *) exit 0 ;;
 esac
 STUB
@@ -5492,7 +7413,7 @@ case "${1:-}" in
     fi
     exit 0
     ;;
-  version) printf '%s\n' '0.0.0-incomplete-toml-test' ;;
+  version) printf '%s\n' '8.30.1-incomplete-toml-test' ;;
   *) exit 0 ;;
 esac
 STUB
@@ -5972,7 +7893,7 @@ if [ -n "$REAL_GITLEAKS" ]; then
   LOCK_B64_BODY=${LOCK_B64%=}
   LOCK_SHA512="${LOCK_B64_BODY}${LOCK_B64_BODY}=="
   LOCK_SECRET=$(printf '%s%s' 'A1b2C3d4E5f6G7h8' 'I9j0K1l2M3n4O5p6')
-  LOCK_PATH_SECRET="${LOWPAT_HEAD}${LOWPAT_BODY}"
+  LOCK_PATH_VALUE=$(printf '%s%s' "$LOWPAT_HEAD" "$LOWPAT_BODY")
   LOCK_HEX=$(printf '%s%s' '0123456789abcdef0123456789abcdef' 'fedcba9876543210fedcba9876543210')
   LOCKFILE_FIXTURE_DIR="$TMP_ROOT/lockfile-hash-dir"
   mkdir -p "$LOCKFILE_FIXTURE_DIR"
@@ -6005,7 +7926,7 @@ if [ -n "$REAL_GITLEAKS" ]; then
     printf '%s\n' '[[package]]'
     printf 'sdist = { url = "https://example.invalid/nul", hash = "sha256:%s" }' \
       "$LOCK_HEX"
-    printf '\000AGDEMO_VAR=%s\n' "$LOCK_PATH_SECRET"
+    printf '\000AGDEMO_VAR=%s\n' "$LOCK_PATH_VALUE"
   } >"$LOCKFILE_FIXTURE_DIR/uv.lock"
   PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" "$PLUGIN_ROOT/bin/agent-guard" \
     scan-path "$LOCKFILE_FIXTURE_DIR/uv.lock" >"$OUT" 2>"$ERR"
@@ -6020,7 +7941,7 @@ if [ -n "$REAL_GITLEAKS" ]; then
     printf '%s\n' '[[package]]'
     printf 'sdist = { url = "https://example.invalid/invalid", hash = "sha256:%s" }' \
       "$LOCK_HEX"
-    printf '\377AGDEMO_VAR=%s\n' "$LOCK_PATH_SECRET"
+    printf '\377AGDEMO_VAR=%s\n' "$LOCK_PATH_VALUE"
   } >"$LOCKFILE_FIXTURE_DIR/uv.lock"
   PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" "$PLUGIN_ROOT/bin/agent-guard" \
     scan-path "$LOCKFILE_FIXTURE_DIR/uv.lock" >"$OUT" 2>"$ERR"
@@ -6045,7 +7966,7 @@ if [ -n "$REAL_GITLEAKS" ]; then
       printf '%s\n' '[[package]]'
       printf 'sdist = { url = "https://example.invalid/untracked", hash = "sha256:%s" }' \
         "$LOCK_HEX"
-      printf '\377AGDEMO_VAR=%s\n' "$LOCK_PATH_SECRET"
+      printf '\377AGDEMO_VAR=%s\n' "$LOCK_PATH_VALUE"
     } >uv.lock
     PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
       "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
@@ -6304,7 +8225,7 @@ if [ -n "$REAL_GITLEAKS" ]; then
     sed 's/^/  stderr: /' "$ERR"
   fi
 
-  printf 'example.com/%s/client v1.2.3 %s\n' "$LOCK_PATH_SECRET" "$LOCK_SUM" \
+  printf 'example.com/%s/client v1.2.3 %s\n' "$LOCK_PATH_VALUE" "$LOCK_SUM" \
     >"$LOCK_GIT_DIR/go.sum"
   (cd "$LOCK_GIT_DIR" && git add go.sum)
   (
@@ -6348,7 +8269,7 @@ if [ -n "$REAL_GITLEAKS" ]; then
     not_ok "Write allows a go.sum checksum (expected 0, got $status)"
   fi
 
-  lock_write=$(jq -nc --arg content "example.com/$LOCK_PATH_SECRET/client v1.2.3 $LOCK_SUM" \
+  lock_write=$(jq -nc --arg content "example.com/$LOCK_PATH_VALUE/client v1.2.3 $LOCK_SUM" \
     '{tool_name:"Write",tool_input:{file_path:"go.sum",content:$content}}')
   printf '%s' "$lock_write" \
     | AGENT_GUARD_GITLEAKS_BIN="$REAL_GITLEAKS" PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
@@ -6372,6 +8293,315 @@ if [ -n "$REAL_GITLEAKS" ]; then
     ok "apply_patch scanning preserves go.sum path context for checksum allowlisting"
   else
     not_ok "apply_patch allows a go.sum checksum (expected 0, got $status)"
+  fi
+
+  # --- #227: a JSON-string tool_input must not bypass the direct path scan ---
+  # A host may serialize tool_input as a JSON-encoded string. PreToolUse decodes
+  # it back into an object; PostToolUse did not, so `post_tool_write_target`
+  # found no path, the direct scan was skipped, and a gitignored or out-of-repo
+  # write went unscanned by both backstops. Tokens are generated at runtime.
+  STR227_REPO="$TMP_ROOT/string-input-227"
+  # Vendor prefix split so this file holds no literal token-shaped string:
+  # plugin scanners flag `<prefix>$(...)` as a hardcoded secret even though the
+  # value is generated at runtime. Same reason the card fixtures are split.
+  STR227_TOKEN="gh""p_$(od -An -N18 -tx1 /dev/urandom | LC_ALL=C tr -d ' \n')"
+  mkdir -p "$STR227_REPO"
+  (
+    cd "$STR227_REPO" || exit 2
+    git init -q . && git config user.email t@t && git config user.name t
+    printf 'ignored/\n' >.gitignore
+    mkdir -p ignored
+    git add .gitignore && git commit -q -m init
+  ) >/dev/null 2>&1
+
+  str227_post() { # $1 = tool_input as object|string
+    printf 'token %s\n' "$STR227_TOKEN" >"$STR227_REPO/ignored/leak.txt"
+    if [ "$1" = object ]; then
+      payload=$(jq -nc --arg p "$STR227_REPO/ignored/leak.txt" --arg d "$STR227_REPO" \
+        '{tool_name:"Write",tool_input:{file_path:$p},cwd:$d}')
+    else
+      payload=$(jq -nc --arg p "$STR227_REPO/ignored/leak.txt" --arg d "$STR227_REPO" \
+        '{tool_name:"Write",tool_input:({file_path:$p}|tostring),cwd:$d}')
+    fi
+    printf '%s' "$payload" \
+      | PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" AGENT_GUARD_HOOK_HOST=claude \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool
+  }
+
+  # MUST-FAIL: the string form must reach the same verdict as the object form.
+  str227_post string >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 2 ]; then
+    ok "#227 a JSON-string tool_input still reaches the direct path scan"
+  else
+    not_ok "#227 JSON-string tool_input reaches the direct scan (expected 2, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # MUST-FAIL control: the object form, which already worked.
+  str227_post object >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 2 ]; then
+    ok "#227 control: an object tool_input keeps its verdict"
+  else
+    not_ok "#227 control: object tool_input keeps its verdict (expected 2, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # MUST-PASS: clean content through the string form stays clean, so the fix
+  # cannot be "block every string-encoded event".
+  printf 'nothing here\n' >"$STR227_REPO/ignored/leak.txt"
+  (
+    payload=$(jq -nc --arg p "$STR227_REPO/ignored/leak.txt" --arg d "$STR227_REPO" \
+      '{tool_name:"Write",tool_input:({file_path:$p}|tostring),cwd:$d}')
+    printf '%s' "$payload" \
+      | PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" AGENT_GUARD_HOOK_HOST=claude \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    ok "#227 control: clean content through a JSON-string tool_input passes"
+  else
+    not_ok "#227 control: clean string-encoded write passes (expected 0, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # --- #224: scan-working-tree must cover the index, not just the worktree ---
+  # Tracked input used to come from `git diff HEAD` alone, so content that lived
+  # only in the index was never scanned: stage a secret, restore the file on
+  # disk to its HEAD contents, and the scan reported clean while the next commit
+  # still carried the secret. Tokens are generated at runtime, so this file
+  # never holds a credential; the bundled vendor-token-shape rule matches on
+  # shape alone, which keeps the verdicts deterministic.
+  INDEX224_REPO="$TMP_ROOT/index-224-repo"
+  # Vendor prefix split so this file holds no literal token-shaped string:
+  # plugin scanners flag `<prefix>$(...)` as a hardcoded secret even though the
+  # value is generated at runtime. Same reason the card fixtures are split.
+  INDEX224_TOKEN="gh""p_$(od -An -N18 -tx1 /dev/urandom | LC_ALL=C tr -d ' \n')"
+  mkdir -p "$INDEX224_REPO"
+  (
+    cd "$INDEX224_REPO" || exit 2
+    git init -q
+    git config user.email test@example.com
+    git config user.name "Agent Guard Tests"
+    printf '%s\n' clean >app.txt
+    git add app.txt
+    git commit -q -m init
+  ) >/dev/null 2>&1
+
+  # MUST-FAIL: index-only secret, worktree restored to its HEAD contents.
+  (
+    cd "$INDEX224_REPO" || exit 2
+    printf 'AGDEMO_VAR=%s\n' "$INDEX224_TOKEN" >app.txt
+    git add app.txt
+    printf '%s\n' clean >app.txt
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+      "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 1 ]; then
+    ok "#224 scan-working-tree detects a secret that exists only in the index"
+  else
+    not_ok "#224 scan-working-tree detects an index-only secret (expected 1, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # MUST-PASS control: a committed secret whose removal is staged and then undone
+  # on disk. Nothing differs from HEAD, so nothing may be reported — that is what
+  # "added lines only" means. Diffing the worktree against the INDEX instead of
+  # against HEAD reads the restored line as an addition and re-reports a secret
+  # that is already committed, so this pins the diff bases, not just the verdict.
+  (
+    cd "$INDEX224_REPO" || exit 2
+    git reset -q --hard
+    printf 'AGDEMO_VAR=%s\nkeep\n' "$INDEX224_TOKEN" >app.txt
+    git add app.txt
+    git commit -q -m "commit the secret"
+    printf 'keep\n' >app.txt
+    git add app.txt
+    printf 'AGDEMO_VAR=%s\nkeep\n' "$INDEX224_TOKEN" >app.txt
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+      "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    ok "#224 control: a staged removal undone on disk re-reports nothing"
+  else
+    not_ok "#224 control: staged removal undone on disk stays clean (expected 0, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+  ( cd "$INDEX224_REPO" && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+
+  # MUST-PASS control: the same repo with nothing staged and nothing on disk.
+  (
+    cd "$INDEX224_REPO" || exit 2
+    git reset -q --hard
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+      "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    ok "#224 control: scan-working-tree allows a repo with a clean index and tree"
+  else
+    not_ok "#224 control: clean index and tree stay clean (expected 0, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # MUST-FAIL control: the pre-existing worktree-only path keeps its verdict.
+  (
+    cd "$INDEX224_REPO" || exit 2
+    printf 'AGDEMO_VAR=%s\n' "$INDEX224_TOKEN" >app.txt
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+      "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 1 ]; then
+    ok "#224 control: scan-working-tree still detects an unstaged worktree secret"
+  else
+    not_ok "#224 control: unstaged worktree secret stays detected (expected 1, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # A repository-controlled textconv driver must not replace the bytes being
+  # scanned. --no-ext-diff does not disable textconv, so exercise both shared
+  # extractor callers and prove the configured helper is never executed.
+  TEXTCONV224_REPO="$TMP_ROOT/textconv-224-repo"
+  TEXTCONV224_CALLED="$TMP_ROOT/textconv-224-called"
+  TEXTCONV224_HELPER="$TMP_ROOT/textconv-224-helper"
+  cat >"$TEXTCONV224_HELPER" <<EOSH
+#!/usr/bin/env sh
+: >"$TEXTCONV224_CALLED"
+printf '%s\n' clean
+EOSH
+  chmod +x "$TEXTCONV224_HELPER"
+  mkdir -p "$TEXTCONV224_REPO"
+  (
+    cd "$TEXTCONV224_REPO" || exit 2
+    git init -q
+    git config user.email test@example.com
+    git config user.name "Agent Guard Tests"
+    git config diff.fixture.textconv "$TEXTCONV224_HELPER"
+    printf '%s\n' 'payload.txt diff=fixture' >.gitattributes
+    printf '%s\n' clean >payload.txt
+    git add .gitattributes payload.txt
+    git commit -q -m init
+  )
+  TEXTCONV224_TOKEN_PART_1="AGENT_GUARD_TEST_"
+  TEXTCONV224_TOKEN_PART_2="SECRET"
+  TEXTCONV224_TOKEN=$(printf '%s%s' "$TEXTCONV224_TOKEN_PART_1" "$TEXTCONV224_TOKEN_PART_2")
+
+  printf '%s\n' "$TEXTCONV224_TOKEN" >"$TEXTCONV224_REPO/payload.txt"
+  (
+    cd "$TEXTCONV224_REPO" || exit 2
+    "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 1 ] && [ ! -e "$TEXTCONV224_CALLED" ]; then
+    ok "scan-working-tree ignores repository textconv and scans raw additions"
+  else
+    not_ok "scan-working-tree disables textconv (expected finding 1 and no helper call, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  rm -f "$TEXTCONV224_CALLED"
+  (
+    cd "$TEXTCONV224_REPO" || exit 2
+    git add payload.txt
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 1 ] && [ ! -e "$TEXTCONV224_CALLED" ]; then
+    ok "scan-staged ignores repository textconv and scans raw additions"
+  else
+    not_ok "scan-staged disables textconv (expected finding 1 and no helper call, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # Presentation configuration is another repository-controlled override of
+  # the diff protocol. ANSI prefixes prevent the header/hunk parser from seeing
+  # its anchors, so force color off for both shared extractor callers.
+  (
+    cd "$TEXTCONV224_REPO" || exit 2
+    git reset -q --hard HEAD
+    git config --unset diff.fixture.textconv
+    git config color.ui always
+    printf '%s\n' "$TEXTCONV224_TOKEN" >payload.txt
+    "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 1 ]; then
+    ok "scan-working-tree ignores color.ui=always and parses raw diff protocol"
+  else
+    not_ok "scan-working-tree disables configured diff color (expected finding 1, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  (
+    cd "$TEXTCONV224_REPO" || exit 2
+    git add payload.txt
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 1 ]; then
+    ok "scan-staged ignores color.ui=always and parses raw diff protocol"
+  else
+    not_ok "scan-staged disables configured diff color (expected finding 1, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # A repo before its first commit has no HEAD to diff against. That branch
+  # already combined the index and the worktree; its verdicts must not move.
+  NOHEAD224_REPO="$TMP_ROOT/nohead-224-repo"
+  mkdir -p "$NOHEAD224_REPO"
+  (
+    cd "$NOHEAD224_REPO" || exit 2
+    git init -q
+    git config user.email test@example.com
+    git config user.name "Agent Guard Tests"
+    printf '%s\n' clean >app.txt
+    git add app.txt
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+      "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    ok "#224 control: pre-first-commit repo with clean staged content stays clean"
+  else
+    not_ok "#224 control: pre-first-commit clean repo (expected 0, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  (
+    cd "$NOHEAD224_REPO" || exit 2
+    printf 'AGDEMO_VAR=%s\n' "$INDEX224_TOKEN" >app.txt
+    git add app.txt
+    printf '%s\n' clean >app.txt
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+      "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 1 ]; then
+    ok "#224 control: pre-first-commit repo still detects an index-only secret"
+  else
+    not_ok "#224 control: pre-first-commit index-only secret (expected 1, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  (
+    cd "$NOHEAD224_REPO" || exit 2
+    git rm -q --cached app.txt
+    printf '%s\n' clean >app.txt
+    git add app.txt
+    printf 'AGDEMO_VAR=%s\n' "$INDEX224_TOKEN" >app.txt
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+      "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+  ) >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 1 ]; then
+    ok "#224 control: pre-first-commit repo still detects an unstaged secret"
+  else
+    not_ok "#224 control: pre-first-commit unstaged secret (expected 1, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
   fi
 
 else
@@ -6423,6 +8653,123 @@ post_tool_out() {
     >"$OUT" 2>"$ERR"
 }
 
+# Execute the generated Claude command with synthetic events to prove the
+# manifest-command/handler contract. This does not prove Claude runtime
+# dispatch; the matcher checks above are a structural approximation of that
+# host-owned boundary.
+claude_generated_post_command=$(jq -r \
+  '.hooks.PostToolUse[0].hooks[0].command' "$PLUGIN_ROOT/hooks/hooks.json")
+for generated_post_tool in PowerShell Skill Monitor LSP ListMcpResourcesTool; do
+  jq -nc --arg tool "$generated_post_tool" \
+    '{tool_name:$tool,tool_input:{},
+      tool_response:{stdout:"AGENT_GUARD_TEST_SECRET",stderr:""}}' \
+    | (cd "$TMP_ROOT" && CLAUDE_PLUGIN_ROOT="$PLUGIN_ROOT" \
+        sh -c "$claude_generated_post_command") >"$OUT" 2>"$ERR"
+  generated_post_status=$?
+  if [ "$generated_post_status" -eq 0 ] \
+     && grep -Fq '[REDACTED]' "$OUT" \
+     && ! grep -Fq 'AGENT_GUARD_TEST_SECRET' "$OUT"; then
+    ok "generated Claude PostToolUse command routes $generated_post_tool to the redaction handler contract"
+  else
+    not_ok "generated Claude PostToolUse command/handler contract failed for $generated_post_tool (status $generated_post_status)"
+    sed 's/^/  stdout: /' "$OUT"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+# A disk finding and a result finding compete for the hook's single stdout JSON
+# slot. Keep the host-valid masking response on stdout, surface the disk finding
+# on stderr, and record the combined event as blocked in the metadata-only log.
+COMBINED_REPO="$TMP_ROOT/post-tool-combined"
+mkdir -p "$COMBINED_REPO"
+(
+  cd "$COMBINED_REPO" || exit 2
+  git init -q
+  git config user.email t@e
+  git config user.name t
+  printf '%s\n' clean > README.md
+  git add README.md
+  git commit -q -m init
+)
+combined_value=$(printf '%s%s%s%s%s%s' 'AGENT_' 'GUARD_' 'TEST_' 'SE' 'CRET=' 'K7mQ2vN9xR4cT8pL6sW3')
+printf '%s\n' "$combined_value" >"$COMBINED_REPO/staged.txt"
+git -C "$COMBINED_REPO" add staged.txt
+
+for combined_host in claude codex; do
+  combined_state="$TESTTMP/combined-state-$combined_host"
+  mkdir -p "$combined_state"
+  chmod 700 "$combined_state"
+  combined_state=$(CDPATH= cd -- "$combined_state" && pwd -P)
+  jq -nc --arg wd "$COMBINED_REPO" --arg stdout "$combined_value" \
+    '{tool_name:"Bash",tool_input:{command:"printf",workdir:$wd},
+      tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}' \
+    | AGENT_GUARD_HOOK_HOST="$combined_host" \
+      AGENT_GUARD_LOG_MODE=on XDG_STATE_HOME="$combined_state" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+  combined_status=$?
+  combined_docs=$(jq -s 'length' <"$OUT" 2>/dev/null)
+  if [ "$combined_host" = claude ]; then
+    combined_shape=$(jq -e '
+      .hookSpecificOutput.updatedToolOutput
+      | type == "object" and has("stdout") and has("stderr")
+        and has("interrupted") and has("isImage")
+    ' "$OUT" >/dev/null 2>&1; printf '%s' "$?")
+  else
+    combined_shape=$(jq -e '
+      .decision == "block"
+      and (.hookSpecificOutput.hookEventName == "PostToolUse")
+      and (.hookSpecificOutput.additionalContext | type == "string")
+    ' "$OUT" >/dev/null 2>&1; printf '%s' "$?")
+  fi
+  combined_audit=$(jq -s -e '
+    any(.[]; .phase == "finished" and .command == "hook-post-tool"
+            and .outcome == "blocked" and .exit_code == 0)
+  ' "$combined_state"/agent-guard/event-* >/dev/null 2>&1; printf '%s' "$?")
+  if [ "$combined_status" -eq 0 ] && [ "$combined_docs" -eq 1 ] \
+     && [ "$combined_shape" -eq 0 ] && [ "$combined_audit" -eq 0 ] \
+     && grep -q 'changed files contain secret-like values' "$ERR" \
+     && ! grep -Fq "$combined_value" "$OUT"; then
+    ok "post-tool preserves disk and output findings in one $combined_host response"
+  else
+    not_ok "post-tool preserves disk and output findings in one $combined_host response (status $combined_status, docs $combined_docs)"
+    sed 's/^/  stdout: /' "$OUT"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+# Exercise the second mutation backstop too: an ignored target is absent from
+# git's candidate set, so the direct named-path scan owns the disk finding.
+printf '%s\n' ignored.txt >"$COMBINED_REPO/.gitignore"
+git -C "$COMBINED_REPO" add .gitignore
+git -C "$COMBINED_REPO" commit -q -m ignore
+printf '%s\n' "$combined_value" >"$COMBINED_REPO/ignored.txt"
+direct_combined_state="$TESTTMP/direct-combined-state"
+mkdir -p "$direct_combined_state"
+chmod 700 "$direct_combined_state"
+direct_combined_state=$(CDPATH= cd -- "$direct_combined_state" && pwd -P)
+jq -nc --arg wd "$COMBINED_REPO" --arg stdout "$combined_value" \
+  '{tool_name:"Write",tool_input:{file_path:"ignored.txt",workdir:$wd},
+    tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}' \
+  | AGENT_GUARD_LOG_MODE=on XDG_STATE_HOME="$direct_combined_state" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+direct_combined_status=$?
+direct_combined_audit=$(jq -s -e '
+  any(.[]; .phase == "finished" and .command == "hook-post-tool"
+          and .outcome == "blocked" and .exit_code == 0)
+' "$direct_combined_state"/agent-guard/event-* >/dev/null 2>&1; printf '%s' "$?")
+if [ "$direct_combined_status" -eq 0 ] \
+   && [ "$(jq -s 'length' <"$OUT" 2>/dev/null)" -eq 1 ] \
+   && [ "$direct_combined_audit" -eq 0 ] \
+   && jq -e '.hookSpecificOutput.updatedToolOutput | type == "object"' "$OUT" >/dev/null 2>&1 \
+   && grep -q 'file this tool call wrote contains secret-like values' "$ERR" \
+   && ! grep -Fq "$combined_value" "$OUT"; then
+  ok "post-tool direct target finding does not skip output masking"
+else
+  not_ok "post-tool direct target finding does not skip output masking (status $direct_combined_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
 post_tool_out '{"tool_name":"Bash","tool_input":{"command":"loadsecrets"},"tool_response":{"stdout":"token AGENT_GUARD_TEST_SECRET here\n","stderr":"","interrupted":false,"isImage":false}}'
 post_status=$?
 post_out=$(cat "$OUT")
@@ -6433,6 +8780,16 @@ if [ "$post_status" -eq 0 ] \
   ok "post-tool masks a gitleaks-detected secret in Bash stdout (shape preserved)"
 else
   not_ok "post-tool masks a gitleaks-detected secret in Bash stdout (status $post_status)"
+  printf '%s\n' "$post_out" | sed 's/^/  out: /'
+fi
+
+post_tool_out '{"tool_name":"Agent","tool_input":{"subagent_type":"Explore","prompt":"audit"},"tool_response":{"stdout":"found AGENT_GUARD_TEST_SECRET\n","stderr":"","interrupted":false,"isImage":false}}'
+post_out=$(cat "$OUT")
+if printf '%s' "$post_out" | grep -q '\[REDACTED\]' \
+   && ! printf '%s' "$post_out" | grep -q 'AGENT_GUARD_TEST_SECRET'; then
+  ok "post-tool masks a secret returned by an Agent subagent"
+else
+  not_ok "post-tool masks a secret returned by an Agent subagent"
   printf '%s\n' "$post_out" | sed 's/^/  out: /'
 fi
 
@@ -6467,6 +8824,63 @@ if printf '%s' "$post_out" | grep -q '\[REDACTED\]' \
   ok "post-tool env-assignment heuristic masks KEY=value gitleaks misses"
 else
   not_ok "post-tool env-assignment heuristic masks KEY=value gitleaks misses"
+  printf '%s\n' "$post_out" | sed 's/^/  out: /'
+fi
+
+# Exact documentation placeholders are not credentials. Keep the exception at
+# the complete assignment value: quoted/case/separator forms pass, while values
+# that merely contain a placeholder word retain the independent env heuristic.
+placeholder_output=$(printf '%s\n%s\n%s\n%s' \
+  'API_KEY=example_token' 'TOKEN="Example-Key"' \
+  'CLIENT_SECRET=DUMMY_SECRET' 'PASSWORD=not-a-real-password')
+placeholder_input=$(jq -nc --arg output "$placeholder_output" \
+  '{tool_name:"Read",tool_response:$output}')
+post_tool_out "$placeholder_input"
+placeholder_status=$?
+if [ "$placeholder_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "post-tool leaves exact documentation placeholders visible (Claude)"
+else
+  not_ok "post-tool leaves exact documentation placeholders visible (Claude)"
+  sed 's/^/  out: /' "$OUT"
+fi
+
+printf '%s' "$placeholder_input" \
+  | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=codex \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+placeholder_status=$?
+if [ "$placeholder_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "post-tool leaves exact documentation placeholders visible (Codex)"
+else
+  not_ok "post-tool leaves exact documentation placeholders visible (Codex)"
+  sed 's/^/  out: /' "$OUT"
+fi
+
+for placeholder_lookalike in \
+  example_token_value_long prefixexampletokensuffix xxxxxxxxxxxx 000000000000; do
+  placeholder_lookalike_input=$(jq -nc --arg output \
+    "API_KEY=$placeholder_lookalike" '{tool_name:"Read",tool_response:$output}')
+  post_tool_out "$placeholder_lookalike_input"
+  post_out=$(cat "$OUT")
+  if printf '%s' "$post_out" | grep -q '\[REDACTED\]' \
+     && ! printf '%s' "$post_out" | grep -Fq "$placeholder_lookalike"; then
+    ok "post-tool still masks non-exact placeholder lookalike ($placeholder_lookalike)"
+  else
+    not_ok "post-tool still masks non-exact placeholder lookalike ($placeholder_lookalike)"
+    printf '%s\n' "$post_out" | sed 's/^/  out: /'
+  fi
+done
+
+placeholder_vendor=$(printf '%s%s%s' 'sk-proj-' \
+  'AAAAAAAexample_token' 'BBBBBBBBCCCCCC')
+placeholder_vendor_input=$(jq -nc --arg output "API_KEY=$placeholder_vendor" \
+  '{tool_name:"Read",tool_response:$output}')
+post_tool_out "$placeholder_vendor_input"
+post_out=$(cat "$OUT")
+if printf '%s' "$post_out" | grep -q '\[REDACTED\]' \
+   && ! printf '%s' "$post_out" | grep -Fq "$placeholder_vendor"; then
+  ok "post-tool masks a vendor-shaped value embedding a placeholder word"
+else
+  not_ok "post-tool masks a vendor-shaped value embedding a placeholder word"
   printf '%s\n' "$post_out" | sed 's/^/  out: /'
 fi
 
@@ -7460,11 +9874,95 @@ for display_case in \
   fi
 done
 
+# #180: when the assignment itself begins a line inside quotes, the trailing
+# quote belongs to the enclosing string rather than to the credential. The old
+# duplicate-mapping guard kept that quote attached and the heuristic treated
+# the value as a source-code reference, leaking it in full.
+quoted_assignment_multiline=$(printf 'line0\n"API_KEY=%s"' "$JSONLEAF_SECRET")
+for display_case in \
+  "\"API_KEY=$JSONLEAF_SECRET\"" \
+  "$quoted_assignment_multiline"; do
+  display_input=$(jq -nc --arg stdout "$display_case" \
+    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
+  post_tool_out "$display_input"
+  post_out=$(cat "$OUT")
+  if printf '%s' "$post_out" | grep -q '\[REDACTED\]' \
+     && ! printf '%s' "$post_out" | grep -Fq "$JSONLEAF_SECRET"; then
+    ok "#180 post-tool masks a quoted assignment that begins a line"
+  else
+    not_ok "#180 post-tool masks a quoted assignment that begins a line"
+    printf '%s\n' "$post_out" | sed 's/^/  out: /'
+  fi
+done
+
+# Re-scanning inside an outer quoted value is still load-bearing, but it can
+# rediscover a short inner assignment after the wider value was already
+# recorded. The narrower contextual mapping must not beat that wider literal
+# and strand the inner key prefix on display.
+quoted_duplicate=$(printf '%s%s' 'PASSWORD=abc) API_TOKEN="' \
+  'PASSWORD=abc)" status=ok')
+display_input=$(jq -nc --arg stdout "$quoted_duplicate" \
+  '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
+post_tool_out "$display_input"
+post_out=$(jq -r '.hookSpecificOutput.updatedToolOutput.stdout // empty' "$OUT" 2>/dev/null)
+if [ "$post_out" = 'PASSWORD=[REDACTED]) API_TOKEN="[REDACTED]" status=ok' ]; then
+  ok "#180 a duplicate inner mapping does not strand its key prefix"
+else
+  not_ok "#180 a duplicate inner mapping does not strand its key prefix"
+  printf '%s\n' "$post_out" | sed 's/^/  out: /'
+fi
+
+# Coverage is span-specific, not a substring shortcut. A separate short value
+# must still get its own contextual mapping even when its text occurs inside a
+# previously emitted longer credential.
+quoted_distinct_short=$(printf '%s%s' 'API_TOKEN="' \
+  'abc-long-value" PASSWORD=abc)')
+display_input=$(jq -nc --arg stdout "$quoted_distinct_short" \
+  '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
+post_tool_out "$display_input"
+post_out=$(jq -r '.hookSpecificOutput.updatedToolOutput.stdout // empty' "$OUT" 2>/dev/null)
+if [ "$post_out" = 'API_TOKEN="[REDACTED]" PASSWORD=[REDACTED])' ]; then
+  ok "#180 a separate short credential is not suppressed by substring overlap"
+else
+  not_ok "#180 a separate short credential is not suppressed by substring overlap"
+  printf '%s\n' "$post_out" | sed 's/^/  out: /'
+fi
+
+# The mixed-quote shapes that invalidated the earlier position/span attempts
+# still depend on the inner re-scan. Keep representative credential-shaped
+# values pinned so closing the line-start leak cannot reopen those leaks. Build
+# the fixture at runtime so repository-wide secret scanners do not mistake the
+# inert test value for a committed credential.
+mixed_quote_secret=$(printf '%s%s' 'Ab3xQ9zP' 'Lm4Kd7')
+mixed_quote_case_a="error: api_key\`: \"ab; end password=$mixed_quote_secret\"}]"
+mixed_quote_case_b="x \"API_KEY'=\`none'' API_KEY=\`$mixed_quote_secret]"
+for display_case in \
+  "$mixed_quote_case_a" \
+  "$mixed_quote_case_b"; do
+  display_input=$(jq -nc --arg stdout "$display_case" \
+    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
+  post_tool_out "$display_input"
+  post_out=$(cat "$OUT")
+  if printf '%s' "$post_out" | grep -q '\[REDACTED\]' \
+     && ! printf '%s' "$post_out" | grep -Fq "$mixed_quote_secret"; then
+    ok "#180 mixed quotes keep nested credential masking"
+  else
+    not_ok "#180 mixed quotes keep nested credential masking"
+    printf '%s\n' "$post_out" | sed 's/^/  out: /'
+  fi
+done
+
 # The same shape on the BLOCK path, since a serialized log is exactly what an
 # agent pastes back into a prompt.
 jsonleaf_prompt="{\"log\":\"DB_PASSWORD=$JSONLEAF_SECRET\"}"
 expect_json_status 2 "#178 an assignment inside a quoted JSON string leaf still blocks at the prompt guard" \
   "$(jq -nc --arg prompt "$jsonleaf_prompt" \
+    '{session_id:"t",hook_event_name:"UserPromptSubmit",prompt:$prompt}')" \
+  hook-user-prompt
+
+quoted_assignment_prompt="\"API_KEY=$JSONLEAF_SECRET\""
+expect_json_status 2 "#180 a quoted line-start assignment blocks at the prompt guard" \
+  "$(jq -nc --arg prompt "$quoted_assignment_prompt" \
     '{session_id:"t",hook_event_name:"UserPromptSubmit",prompt:$prompt}')" \
   hook-user-prompt
 
@@ -8055,6 +10553,215 @@ else
   sed 's/^/  out: /' "$OUT"
 fi
 
+# Image and PDF payloads are exempt from the size cap and the rewrite: a text
+# scanner cannot read pixels, and a screenshot alone crosses the cap.
+oversize_image_input=$(jq -nc '
+  {tool_name:"Read",tool_input:{file_path:"logo.png"},
+   tool_response:{type:"image",
+                  file:{base64:("A" * 400000),type:"image/png",
+                        originalSize:400000}}}
+')
+post_tool_out "$oversize_image_input"
+oversize_image_status=$?
+if [ "$oversize_image_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "post-tool passes an over-cap Read image block through untouched"
+else
+  not_ok "post-tool passes an over-cap Read image block through untouched"
+  cut -c1-200 "$OUT" | sed 's/^/  out: /'
+fi
+
+oversize_block_input=$(jq -nc '
+  {tool_name:"mcp__example__screenshot",tool_input:{},
+   tool_response:[{type:"text",text:"captured"},
+                  {type:"image",
+                   source:{type:"base64",media_type:"image/png",
+                           data:("A" * 400000)}}]}
+')
+post_tool_out "$oversize_block_input"
+oversize_block_status=$?
+if [ "$oversize_block_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "post-tool passes an over-cap MCP image block through untouched"
+else
+  not_ok "post-tool passes an over-cap MCP image block through untouched"
+  cut -c1-200 "$OUT" | sed 's/^/  out: /'
+fi
+
+oversize_pdf_input=$(jq -nc '
+  {tool_name:"mcp__example__export",tool_input:{},
+   tool_response:[{type:"document",
+                   source:{type:"base64",media_type:"application/pdf",
+                           data:("A" * 400000)}}]}
+')
+post_tool_out "$oversize_pdf_input"
+oversize_pdf_status=$?
+if [ "$oversize_pdf_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "post-tool passes an over-cap PDF document block through untouched"
+else
+  not_ok "post-tool passes an over-cap PDF document block through untouched"
+  cut -c1-200 "$OUT" | sed 's/^/  out: /'
+fi
+
+# MCP's own image block carries the payload at the top level as `data` and
+# spells the media type `mimeType`.
+oversize_mcp_native_input=$(jq -nc '
+  {tool_name:"mcp__example__screenshot",tool_input:{},
+   tool_response:[{type:"text",text:"captured"},
+                  {type:"image",data:("A" * 400000),mimeType:"image/png"}]}
+')
+post_tool_out "$oversize_mcp_native_input"
+oversize_mcp_native_status=$?
+if [ "$oversize_mcp_native_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "post-tool passes an over-cap MCP-native image block through untouched"
+else
+  not_ok "post-tool passes an over-cap MCP-native image block through untouched"
+  cut -c1-200 "$OUT" | sed 's/^/  out: /'
+fi
+
+# Claude Code's Read tags a PDF `{"type":"pdf","file":{...}}` with no media
+# type anywhere.
+oversize_read_pdf_input=$(jq -nc '
+  {tool_name:"Read",tool_input:{file_path:"spec.pdf"},
+   tool_response:{type:"pdf",
+                  file:{filePath:"spec.pdf",base64:("A" * 400000),
+                        originalSize:300000}}}
+')
+post_tool_out "$oversize_read_pdf_input"
+oversize_read_pdf_status=$?
+if [ "$oversize_read_pdf_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "post-tool passes an over-cap Read PDF block through untouched"
+else
+  not_ok "post-tool passes an over-cap Read PDF block through untouched"
+  cut -c1-200 "$OUT" | sed 's/^/  out: /'
+fi
+
+# Only the payload is exempt: a text sibling is scanned at its own size.
+mixed_block_input=$(jq -nc '
+  {tool_name:"mcp__example__screenshot",tool_input:{},
+   tool_response:[{type:"text",text:"token AGENT_GUARD_TEST_SECRET here"},
+                  {type:"image",
+                   source:{type:"base64",media_type:"image/png",
+                           data:("A" * 400000)}}]}
+')
+post_tool_out "$mixed_block_input"
+mixed_block_status=$?
+post_out=$(cat "$OUT")
+if [ "$mixed_block_status" -eq 0 ] \
+   && ! printf '%s' "$post_out" | grep -q 'AGENT_GUARD_TEST_SECRET' \
+   && printf '%s' "$post_out" \
+        | jq -e '
+            .hookSpecificOutput.updatedToolOutput as $out
+            | $out[0].type == "text"
+            and ($out[0].text | contains("[REDACTED]"))
+            and $out[1].type == "image"
+            and $out[1].source.type == "base64"
+            and $out[1].source.media_type == "image/png"
+            and $out[1].source.data == ("A" * 400000)
+          ' >/dev/null 2>&1; then
+  ok "post-tool masks the text sibling and restores the image payload intact"
+else
+  not_ok "post-tool masks the text sibling and restores the image payload intact"
+  printf '%s\n' "$post_out" | cut -c1-200 | sed 's/^/  out: /'
+fi
+
+# The payload is opaque by design: the host forwards it as bytes of the
+# declared media type, never as text the model reads.
+payload_secret_input=$(jq -nc '
+  {tool_name:"mcp__example__screenshot",tool_input:{},
+   tool_response:[{type:"image",
+                   source:{type:"base64",media_type:"image/png",
+                           data:"token AGENT_GUARD_TEST_SECRET here"}}]}
+')
+post_tool_out "$payload_secret_input"
+payload_secret_status=$?
+if [ "$payload_secret_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "post-tool does not inspect the payload of a binary content block"
+else
+  not_ok "post-tool does not inspect the payload of a binary content block"
+  cut -c1-200 "$OUT" | sed 's/^/  out: /'
+fi
+
+# base64 of a text media type (text/plain, SVG) is still text and takes the
+# fail-closed path over the cap. Anthropic content blocks are a discriminated
+# union, so `type`, `source.type` and `media_type` must survive that rewrite:
+# a block tagged `[REDACTED]` is rejected by every later request, permanently,
+# because the host persists it in the session transcript.
+oversize_text_document_input=$(jq -nc '
+  {tool_name:"mcp__example__export",tool_input:{},
+   tool_response:[{type:"text",text:"exported"},
+                  {type:"document",
+                   source:{type:"base64",media_type:"text/plain",
+                           data:("A" * 400000)}}]}
+')
+post_tool_out "$oversize_text_document_input"
+oversize_text_document_status=$?
+post_out=$(cat "$OUT")
+if [ "$oversize_text_document_status" -eq 0 ] \
+   && printf '%s' "$post_out" \
+        | jq -e '
+            .hookSpecificOutput.updatedToolOutput as $out
+            | ($out | type) == "array"
+            and $out[0].type == "text"
+            and $out[0].text == "[REDACTED]"
+            and $out[1].type == "document"
+            and $out[1].source.type == "base64"
+            and $out[1].source.media_type == "text/plain"
+            and $out[1].source.data == "[REDACTED]"
+          ' >/dev/null 2>&1; then
+  ok "post-tool keeps content-block discriminators in the over-cap whole-leaf mask"
+else
+  not_ok "post-tool keeps content-block discriminators in the over-cap whole-leaf mask"
+  printf '%s\n' "$post_out" | cut -c1-200 | sed 's/^/  out: /'
+fi
+
+oversize_svg_input=$(jq -nc '
+  {tool_name:"Read",tool_input:{file_path:"logo.svg"},
+   tool_response:{type:"image",
+                  file:{base64:("A" * 400000),type:"image/svg+xml",
+                        originalSize:400000}}}
+')
+post_tool_out "$oversize_svg_input"
+oversize_svg_status=$?
+post_out=$(cat "$OUT")
+if [ "$oversize_svg_status" -eq 0 ] \
+   && printf '%s' "$post_out" \
+        | jq -e '
+            .hookSpecificOutput.updatedToolOutput as $out
+            | $out.type == "image"
+            and $out.file.type == "[REDACTED]"
+            and $out.file.base64 == "[REDACTED]"
+          ' >/dev/null 2>&1; then
+  ok "post-tool still masks an over-cap image block of a text media type"
+else
+  not_ok "post-tool still masks an over-cap image block of a text media type"
+  printf '%s\n' "$post_out" | cut -c1-200 | sed 's/^/  out: /'
+fi
+
+# The exemption is an allowlist of VALUES, not of key names. A `type` holding
+# anything other than a known protocol token is still masked, so a secret
+# parked under that key cannot ride the shape exemption out to the model.
+oversize_foreign_type_input=$(jq -nc '
+  {tool_name:"Read",tool_input:{file_path:"dump.json"},
+   tool_response:{type:"not-a-protocol-token",
+                  media_type:"application/x-made-up",
+                  payload:("A" * 400000)}}
+')
+post_tool_out "$oversize_foreign_type_input"
+oversize_foreign_type_status=$?
+post_out=$(cat "$OUT")
+if [ "$oversize_foreign_type_status" -eq 0 ] \
+   && printf '%s' "$post_out" \
+        | jq -e '
+            .hookSpecificOutput.updatedToolOutput as $out
+            | $out.type == "[REDACTED]"
+            and $out.media_type == "[REDACTED]"
+            and $out.payload == "[REDACTED]"
+          ' >/dev/null 2>&1; then
+  ok "post-tool masks a non-protocol type value in the whole-leaf path"
+else
+  not_ok "post-tool masks a non-protocol type value in the whole-leaf path"
+  printf '%s\n' "$post_out" | cut -c1-200 | sed 's/^/  out: /'
+fi
+
 # Gitleaks work must be bounded before it scans or writes a high-cardinality
 # report. The stub records stdin-mode invocation and can emit a report above the
 # 64 KiB cap without using assignment, JWT, or Bearer-shaped fixture content.
@@ -8066,7 +10773,7 @@ mkdir -p "$BOUNDED_GL_DIR"
   printf '%s\n' '#!/bin/sh'
   printf '%s\n' 'mode=${1:-}'
   printf '%s\n' 'case "$mode" in'
-  printf '%s\n' '  version) printf "%s\n" "0.0.0-bounded-test"; exit 0 ;;'
+  printf '%s\n' '  version) printf "%s\n" "8.30.1-bounded-test"; exit 0 ;;'
   printf '%s\n' '  stdin)'
   printf '%s\n' '    shift; report='
   printf '%s\n' '    while [ "$#" -gt 0 ]; do'
@@ -8173,19 +10880,273 @@ else
   printf '%s\n' "$post_out" | sed 's/^/  out: /'
 fi
 
-# If the shape-preserving whole-leaf jq transform itself fails, mandatory
-# redaction must still reach both host envelopes as a JSON string sentinel.
+# If the primary shape-preserving jq transform fails, the portable lexer must
+# still emit one replacement with the native tool-response shape. PostToolUse
+# exit status cannot retract the result Claude already produced.
 FAIL_WHOLE_JQ_DIR="$TMP_ROOT/fail-whole-jq"
 FAIL_WHOLE_JQ="$FAIL_WHOLE_JQ_DIR/jq"
 mkdir -p "$FAIL_WHOLE_JQ_DIR"
 {
   printf '%s\n' '#!/bin/sh'
+  printf '%s\n' 'case "$*" in'
+  printf '%s\n' '  *".tool_response // empty"*)'
+  printf '%s\n' '    if [ -n "${AGENT_GUARD_TEST_RESPONSE_FILE:-}" ]; then cat "$AGENT_GUARD_TEST_RESPONSE_FILE"; exit 0; fi'
+  printf '%s\n' '    ;;'
+  printf '%s\n' 'esac'
+  printf '%s\n' 'if [ "${AGENT_GUARD_TEST_PARTIAL_ENVELOPE:-0}" = 1 ]; then'
+  printf '%s\n' '  case "$*" in *"additionalContext:"*) printf "{\"partial\":"; exit 2 ;; esac'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'if [ "${AGENT_GUARD_TEST_FAIL_RESTORE:-0}" = 1 ]; then'
+  printf '%s\n' '  case "$*" in *'\''.[0] as $orig'\''*) printf "{\"partial\":"; exit 2 ;; esac'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'case "$*" in *'\''contains("\u0000")'\''*) exit 2 ;; esac'
   printf '%s\n' 'case " $* " in'
-  printf '%s\n' '  *"length > 0"*) exit 2 ;;'
+  printf '%s\n' '  *"length > 0"*)'
+  printf '%s\n' '    if [ "${AGENT_GUARD_TEST_PARTIAL_PRIMARY:-0}" = 1 ]; then printf "{\"partial\":"; fi'
+  printf '%s\n' '    exit 2'
+  printf '%s\n' '    ;;'
   printf '%s\n' 'esac'
   printf '%s\n' 'exec "${AGENT_GUARD_TEST_REAL_JQ:?}" "$@"'
 } >"$FAIL_WHOLE_JQ"
 chmod +x "$FAIL_WHOLE_JQ"
+
+FAIL_STAGE_JQ_DIR="$TMP_ROOT/fail-stage-jq"
+FAIL_STAGE_JQ="$FAIL_STAGE_JQ_DIR/jq"
+mkdir -p "$FAIL_STAGE_JQ_DIR"
+{
+  printf '%s\n' '#!/bin/sh'
+  printf '%s\n' 'partial_fail() { printf "{\"partial\":"; exit 2; }'
+  printf '%s\n' 'case "${AGENT_GUARD_TEST_PARTIAL_STAGE:-}:$*" in'
+  printf '%s\n' '  extract:*".tool_response // empty"*) partial_fail ;;'
+  printf '%s\n' '  precise:*"def context_replace"*) partial_fail ;;'
+  printf '%s\n' '  strip:*"strip_binary_payloads") partial_fail ;;'
+  printf '%s\n' '  nul:*'\''contains("\u0000")'\''*) partial_fail ;;'
+  printf '%s\n' '  restore:*'\''.[0] as $orig'\''*) partial_fail ;;'
+  printf '%s\n' '  detector_leaf:*"join(\"\\n\") end"*) partial_fail ;;'
+  printf '%s\n' '  detector_frame:*"gsub(\"\\u001f\""*) partial_fail ;;'
+  printf '%s\n' '  detector_report:*".Secret // empty"*) partial_fail ;;'
+  printf '%s\n' '  detector_bundle:*"secrets: unique"*) partial_fail ;;'
+  printf '%s\n' '  bundle_classify_true:*"invalid secret bundle"*) printf "true"; exit 2 ;;'
+  printf '%s\n' '  bundle_extract_secrets:*"invalid secret bundle"*) printf "[]"; exit 2 ;;'
+  printf '%s\n' 'esac'
+  printf '%s\n' 'exec "${AGENT_GUARD_TEST_REAL_JQ:?}" "$@"'
+} >"$FAIL_STAGE_JQ"
+chmod +x "$FAIL_STAGE_JQ"
+
+partial_stage_input=$(jq -nc '
+  {tool_name:"Read",tool_input:{},
+   tool_response:{stdout:("PASS" + "WORD=" + "R7qM3vN9xK2pT8cL"),clean:"visible"}}
+')
+partial_stage_expected="$TESTTMP/partial-stage-expected"
+jq -nc '
+  {hookSpecificOutput:{hookEventName:"PostToolUse",
+    updatedToolOutput:{stdout:"[REDACTED]",clean:"[REDACTED]"}}}
+' >"$partial_stage_expected"
+for partial_stage in extract precise nul; do
+  printf '%s' "$partial_stage_input" \
+    | PATH="$FAIL_STAGE_JQ_DIR:$PATH" \
+      AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+      AGENT_GUARD_TEST_PARTIAL_STAGE="$partial_stage" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+  partial_stage_status=$?
+  if [ "$partial_stage_status" -eq 0 ] \
+     && cmp -s "$partial_stage_expected" "$OUT" \
+     && ! grep -q 'R7qM3vN9xK2pT8cL' "$OUT"; then
+    ok "post-tool discards partial $partial_stage transform output before conservative replacement"
+  else
+    not_ok "post-tool accepts partial $partial_stage transform output (status $partial_stage_status)"
+    cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+detector_partial_expected="$TESTTMP/detector-partial-expected"
+jq -nc '
+  {hookSpecificOutput:{hookEventName:"PostToolUse",
+    updatedToolOutput:{stdout:"[REDACTED]",clean:"[REDACTED]"}}}
+' >"$detector_partial_expected"
+detector_pat=$(printf '%s%s' 'github_pat_11AA22BB33CC' '44DD55EE66FF77GG88HH')
+detector_jwt=$(printf '%s%s' 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0' 'NTY3ODkwIn0.S4fN8qK2vM7xT3pL')
+detector_bearer=$(printf '%s%s' 'Authorization: Bearer R7qM3vN9xK2p' 'T8cL5sW4')
+for detector_value in "$detector_pat" "$detector_jwt" "$detector_bearer"; do
+  detector_partial_input=$(jq -nc --arg value "$detector_value" '
+    {tool_name:"Read",tool_input:{},tool_response:{stdout:$value,clean:"visible"}}
+  ')
+  printf '%s' "$detector_partial_input" \
+    | PATH="$FAIL_STAGE_JQ_DIR:$PATH" \
+      AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+      AGENT_GUARD_TEST_PARTIAL_STAGE=detector_leaf \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+  detector_partial_status=$?
+  if [ "$detector_partial_status" -eq 0 ] \
+     && cmp -s "$detector_partial_expected" "$OUT" \
+     && ! grep -Fq "$detector_value" "$OUT"; then
+    ok "post-tool discards partial detector leaf extraction for a compact token"
+  else
+    not_ok "post-tool accepts partial detector leaf extraction (status $detector_partial_status)"
+    cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+detector_pat_input=$(jq -nc --arg value "$detector_pat" '
+  {tool_name:"Read",tool_input:{},tool_response:{stdout:$value,clean:"visible"}}
+')
+for detector_stage in detector_report detector_bundle; do
+  printf '%s' "$detector_pat_input" \
+    | PATH="$FAIL_STAGE_JQ_DIR:$PATH" \
+      AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+      AGENT_GUARD_TEST_PARTIAL_STAGE="$detector_stage" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+  detector_stage_status=$?
+  if [ "$detector_stage_status" -eq 0 ] \
+     && cmp -s "$detector_partial_expected" "$OUT" \
+     && ! grep -Fq "$detector_pat" "$OUT"; then
+    ok "post-tool discards partial $detector_stage output before conservative replacement"
+  else
+    not_ok "post-tool accepts partial $detector_stage output (status $detector_stage_status)"
+    cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+detector_env_value=$(printf '%s%s' 'PASS' 'WORD=smallopaquevalue')
+detector_env_input=$(jq -nc --arg value "$detector_env_value" '
+  {tool_name:"Read",tool_input:{},tool_response:{stdout:$value,clean:"visible"}}
+')
+printf '%s' "$detector_env_input" \
+  | PATH="$FAIL_STAGE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    AGENT_GUARD_TEST_PARTIAL_STAGE=detector_frame \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+detector_env_status=$?
+if [ "$detector_env_status" -eq 0 ] \
+   && cmp -s "$detector_partial_expected" "$OUT" \
+   && ! grep -Fq 'smallopaquevalue' "$OUT"; then
+  ok "post-tool discards partial env framing before conservative replacement"
+else
+  not_ok "post-tool accepts partial env framing (status $detector_env_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+bundle_whole_input=$(jq -nc '
+  {tool_name:"Read",tool_input:{},
+   tool_response:[range(0; 300) | "Bearer compact-token-\(.)-abcdefgh"]}
+')
+bundle_whole_expected="$TESTTMP/bundle-whole-expected"
+jq -nc '
+  {hookSpecificOutput:{hookEventName:"PostToolUse",
+    updatedToolOutput:[range(0; 300) | "[REDACTED]"]}}
+' >"$bundle_whole_expected"
+printf '%s' "$bundle_whole_input" \
+  | "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+bundle_whole_control_status=$?
+if [ "$bundle_whole_control_status" -eq 0 ] \
+   && cmp -s "$bundle_whole_expected" "$OUT"; then
+  ok "post-tool classifies a complete whole-leaf bundle"
+else
+  not_ok "post-tool misclassifies a complete whole-leaf bundle (status $bundle_whole_control_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s' "$bundle_whole_input" \
+  | PATH="$FAIL_STAGE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    AGENT_GUARD_TEST_PARTIAL_STAGE=bundle_classify_true \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+bundle_whole_partial_status=$?
+if [ "$bundle_whole_partial_status" -eq 0 ] \
+   && cmp -s "$bundle_whole_expected" "$OUT" \
+   && [ "$(jq -s 'length' "$OUT" 2>/dev/null)" = 1 ] \
+   && ! grep -Fq 'compact-token-' "$OUT"; then
+  ok "post-tool discards partial whole-leaf bundle classification"
+else
+  not_ok "post-tool accepts partial whole-leaf bundle classification (status $bundle_whole_partial_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+bundle_secrets_value=$(printf '%s%s' 'PASS' 'WORD=smallopaquevalue')
+bundle_secrets_input=$(jq -nc --arg value "prefix $bundle_secrets_value suffix" '
+  {tool_name:"Read",tool_input:{},tool_response:{stdout:$value,clean:"visible"}}
+')
+bundle_secrets_expected="$TESTTMP/bundle-secrets-expected"
+jq -nc '
+  {hookSpecificOutput:{hookEventName:"PostToolUse",
+    updatedToolOutput:{stdout:"prefix PASSWORD=[REDACTED] suffix",clean:"visible"}}}
+' >"$bundle_secrets_expected"
+printf '%s' "$bundle_secrets_input" \
+  | "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+bundle_secrets_status=$?
+if [ "$bundle_secrets_status" -eq 0 ] \
+   && cmp -s "$bundle_secrets_expected" "$OUT"; then
+  ok "post-tool classifies and applies a complete secrets bundle"
+else
+  not_ok "post-tool misclassifies a complete secrets bundle (status $bundle_secrets_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+exec_bundle_value=$(printf '%s%s' 'PASS' 'WORD=smallopaquevalue')
+PATH="$FAIL_STAGE_JQ_DIR:$PATH" \
+  AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+  AGENT_GUARD_TEST_PARTIAL_STAGE=bundle_extract_secrets \
+  "$PLUGIN_ROOT/bin/agent-guard" exec -- \
+    sh -c 'printf "%s\n" "$1"' sh "$exec_bundle_value" >"$OUT" 2>"$ERR"
+exec_bundle_partial_status=$?
+if [ "$exec_bundle_partial_status" -eq 0 ] \
+   && [ "$(cat "$OUT")" = '[REDACTED]' ] \
+   && ! grep -Fq 'smallopaquevalue' "$OUT"; then
+  ok "exec discards partial secrets extraction and masks the complete output"
+else
+  not_ok "exec accepts partial secrets extraction (status $exec_bundle_partial_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+"$PLUGIN_ROOT/bin/agent-guard" exec -- \
+  sh -c 'printf "%s\n" "$1"' sh "$exec_bundle_value" >"$OUT" 2>"$ERR"
+exec_bundle_control_status=$?
+if [ "$exec_bundle_control_status" -eq 0 ] \
+   && [ "$(cat "$OUT")" = 'PASSWORD=[REDACTED]' ]; then
+  ok "exec classifies and applies a complete secrets bundle"
+else
+  not_ok "exec misclassifies a complete secrets bundle (status $exec_bundle_control_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+partial_strip_binary=$(printf '%s%s' 'R7qM3vN9xK2p' 'T8cL5sW4')
+partial_strip_input=$(jq -nc --arg binary "$partial_strip_binary" '
+  {tool_name:"Read",tool_input:{file_path:"image.png"},
+   tool_response:{content:[
+     {type:"image",source:{type:"base64",media_type:"image/png",data:$binary}},
+     {type:"text",text:("PASS" + "WORD=" + "S4fN8qK2vM7xT3pL")}]}}
+')
+partial_strip_expected="$TESTTMP/partial-strip-expected"
+jq -nc '
+  {hookSpecificOutput:{hookEventName:"PostToolUse",
+    updatedToolOutput:{content:[
+      {type:"image",source:{type:"base64",media_type:"image/png",data:"[REDACTED]"}},
+      {type:"text",text:"[REDACTED]"}]}}}
+' >"$partial_strip_expected"
+printf '%s' "$partial_strip_input" \
+  | PATH="$FAIL_STAGE_JQ_DIR:$PATH" \
+    AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+    AGENT_GUARD_TEST_PARTIAL_STAGE=strip \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+partial_strip_status=$?
+if [ "$partial_strip_status" -eq 0 ] \
+   && cmp -s "$partial_strip_expected" "$OUT" \
+   && ! grep -Fq "$partial_strip_binary" "$OUT"; then
+  ok "post-tool discards partial binary-strip output and masks the original native shape"
+else
+  not_ok "post-tool accepts partial binary-strip output (status $partial_strip_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
 
 printf '%s' "$large_gitleaks_input" \
   | (cd "$TMP_ROOT" \
@@ -8195,14 +11156,81 @@ printf '%s' "$large_gitleaks_input" \
 failed_whole_claude_status=$?
 failed_whole_claude_out=$(cat "$OUT")
 if [ "$failed_whole_claude_status" -eq 0 ] \
+   && [ "$(printf '%s' "$failed_whole_claude_out" | jq -s 'length' 2>/dev/null)" = 1 ] \
    && printf '%s' "$failed_whole_claude_out" \
-        | jq -e '.hookSpecificOutput.updatedToolOutput == "[REDACTED]"' \
-          >/dev/null 2>&1 \
-   && ! printf '%s' "$failed_whole_claude_out" | grep -q 'opaque-material-'; then
-  ok "post-tool fail-closes a failed whole-leaf rewrite for Claude"
+        | jq -e '.hookSpecificOutput.updatedToolOutput == "[REDACTED]"' >/dev/null 2>&1; then
+  ok "post-tool uses the portable whole-leaf fallback for Claude"
 else
-  not_ok "post-tool leaks over-cap output when the Claude whole-leaf rewrite fails"
+  not_ok "post-tool emits an invalid Claude fallback when the primary whole-leaf rewrite fails"
   printf '%s\n' "$failed_whole_claude_out" | sed 's/^/  out: /'
+  sed 's/^/  err: /' "$ERR"
+fi
+
+partial_primary_expected="$TESTTMP/partial-primary-expected"
+printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":"[REDACTED]"}}' \
+  >"$partial_primary_expected"
+printf '%s' "$large_gitleaks_input" \
+  | (cd "$TMP_ROOT" \
+      && PATH="$FAIL_WHOLE_JQ_DIR:$PATH" \
+         AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+         AGENT_GUARD_TEST_PARTIAL_PRIMARY=1 \
+         "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+partial_primary_status=$?
+if [ "$partial_primary_status" -eq 0 ] \
+   && cmp -s "$partial_primary_expected" "$OUT"; then
+  ok "whole-leaf rewrite discards partial primary jq output before the awk fallback"
+else
+  not_ok "whole-leaf rewrite accepts partial primary jq output (status $partial_primary_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+FAIL_FALLBACK_CAT_DIR="$TMP_ROOT/fail-fallback-cat"
+FAIL_FALLBACK_CAT="$FAIL_FALLBACK_CAT_DIR/cat"
+mkdir -p "$FAIL_FALLBACK_CAT_DIR"
+{
+  printf '%s\n' '#!/bin/sh'
+  printf '%s\n' 'if [ "$#" -eq 1 ]; then'
+  printf '%s\n' '  case "$1" in */agent-guard.*) printf "{\"partial\":"; exit 2 ;; esac'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'exec "${AGENT_GUARD_TEST_REAL_CAT:?}" "$@"'
+} >"$FAIL_FALLBACK_CAT"
+chmod +x "$FAIL_FALLBACK_CAT"
+printf '%s' "$large_gitleaks_input" \
+  | (cd "$TMP_ROOT" \
+      && PATH="$FAIL_FALLBACK_CAT_DIR:$FAIL_WHOLE_JQ_DIR:$PATH" \
+         AGENT_GUARD_TEST_REAL_CAT="$REAL_CAT" \
+         AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+         AGENT_GUARD_TEST_PARTIAL_PRIMARY=1 \
+         "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+partial_fallback_status=$?
+if [ "$partial_fallback_status" -eq 0 ] \
+   && cmp -s "$partial_primary_expected" "$OUT"; then
+  ok "whole-leaf rewrite discards a partial nonzero fallback and emits one fixed response"
+else
+  not_ok "whole-leaf rewrite exposes partial nonzero fallback output (status $partial_fallback_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+partial_codex_expected="$TESTTMP/partial-codex-expected"
+printf '%s\n' '{"decision":"block","reason":"Agent Guard blocked the original tool output because a sanitized replacement could not be serialized.","hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"Agent Guard blocked a sensitive tool output; the sanitized replacement could not be serialized safely."}}' \
+  >"$partial_codex_expected"
+printf '%s' "$large_gitleaks_input" \
+  | (cd "$TMP_ROOT" \
+      && PATH="$FAIL_WHOLE_JQ_DIR:$PATH" \
+         AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+         AGENT_GUARD_TEST_PARTIAL_ENVELOPE=1 \
+         AGENT_GUARD_HOOK_HOST=codex \
+         "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+partial_codex_status=$?
+if [ "$partial_codex_status" -eq 0 ] \
+   && cmp -s "$partial_codex_expected" "$OUT"; then
+  ok "Codex envelope serialization discards partial jq output before its fixed response"
+else
+  not_ok "Codex envelope serialization concatenates partial and fixed responses (status $partial_codex_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
 fi
 
 printf '%s' "$large_gitleaks_input" \
@@ -8214,15 +11242,163 @@ printf '%s' "$large_gitleaks_input" \
 failed_whole_codex_status=$?
 failed_whole_codex_out=$(cat "$OUT")
 if [ "$failed_whole_codex_status" -eq 0 ] \
+   && [ "$(printf '%s' "$failed_whole_codex_out" | jq -s 'length' 2>/dev/null)" = 1 ] \
    && printf '%s' "$failed_whole_codex_out" \
         | jq -e '.decision == "block"
-                 and (.hookSpecificOutput.additionalContext
-                      | contains("[REDACTED]"))' >/dev/null 2>&1 \
-   && ! printf '%s' "$failed_whole_codex_out" | grep -q 'opaque-material-'; then
-  ok "post-tool fail-closes a failed whole-leaf rewrite for Codex"
+                 and (.hookSpecificOutput.additionalContext | contains("\"[REDACTED]\""))' >/dev/null 2>&1; then
+  ok "post-tool uses the portable whole-leaf fallback for Codex"
 else
-  not_ok "post-tool leaks over-cap output when the Codex whole-leaf rewrite fails"
+  not_ok "post-tool emits an invalid Codex fallback when the primary whole-leaf rewrite fails"
   printf '%s\n' "$failed_whole_codex_out" | sed 's/^/  out: /'
+  sed 's/^/  err: /' "$ERR"
+fi
+
+fallback_native_input=$(jq -nc '
+  {tool_name:"Bash",tool_input:{command:"fixture"},
+   tool_response:{type:"text",foreign_type:"image",arbitrary_type:"opaque",
+                  stdout:("PASSWORD=" + "S7vQ2mN9xK4pT8cL" + ("z" * 270000)),
+                  stderr:"",interrupted:false,isImage:false,count:7,nothing:null,
+                  nested:[{media_type:"text/plain",value:"visible"},true,3.5]}}
+')
+printf '%s' "$fallback_native_input" \
+  | (cd "$TMP_ROOT" \
+      && PATH="$FAIL_WHOLE_JQ_DIR:$PATH" \
+         AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+         "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+fallback_native_status=$?
+if [ "$fallback_native_status" -eq 0 ] \
+   && [ "$(jq -s 'length' <"$OUT" 2>/dev/null)" = 1 ] \
+   && jq -e '
+        .hookSpecificOutput.updatedToolOutput as $out
+        | $out.type == "text"
+          and $out.foreign_type == "[REDACTED]"
+          and $out.arbitrary_type == "[REDACTED]"
+          and $out.stdout == "[REDACTED]"
+          and $out.stderr == ""
+          and $out.interrupted == false
+          and $out.isImage == false
+          and $out.count == 0
+          and $out.nothing == null
+          and $out.nested == [{media_type:"text/plain",value:"[REDACTED]"},false,0]
+      ' "$OUT" >/dev/null 2>&1 \
+   && ! grep -q 'S7vQ2mN9xK4pT8cL' "$OUT"; then
+  ok "portable whole-leaf fallback preserves native nested shape and only allowlisted discriminators"
+else
+  not_ok "portable whole-leaf fallback changes native nested shape or leaks a value (status $fallback_native_status)"
+  sed 's/^/  stdout: /' "$OUT"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+fallback_escaped_response="$TESTTMP/fallback-escaped-response.json"
+{
+  printf '%s%s%s' '{"t\u0079pe":"im\u0061ge","media\u005ftype":"text\/plain","nested":{"type":"opaque","value":"' 'PASS' 'WORD=S3cQ8vN2mK7pL5xT'
+  awk 'BEGIN { for (i = 0; i < 270000; i++) printf "z" }'
+  printf '%s' '"}}'
+} >"$fallback_escaped_response"
+printf '%s' '{"tool_name":"Read","tool_input":{},"tool_response":[]}' \
+  | (cd "$TMP_ROOT" \
+      && PATH="$FAIL_WHOLE_JQ_DIR:$PATH" \
+         AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+         AGENT_GUARD_TEST_RESPONSE_FILE="$fallback_escaped_response" \
+         "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+fallback_escaped_status=$?
+if [ "$fallback_escaped_status" -eq 0 ] \
+   && [ "$(jq -s 'length' <"$OUT" 2>/dev/null)" = 1 ] \
+   && grep -Fq '"t\u0079pe":"im\u0061ge"' "$OUT" \
+   && grep -Fq '"media\u005ftype":"text\/plain"' "$OUT" \
+   && jq -e '
+        .hookSpecificOutput.updatedToolOutput
+        == {type:"image",media_type:"text/plain",
+            nested:{type:"[REDACTED]",value:"[REDACTED]"}}
+      ' "$OUT" >/dev/null 2>&1 \
+   && ! grep -q 'S3cQ8vN2mK7pL5xT' "$OUT"; then
+  ok "portable whole-leaf fallback decodes escaped discriminator semantics while preserving key lexemes"
+else
+  not_ok "portable whole-leaf fallback mishandles escaped discriminator semantics (status $fallback_escaped_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+fallback_binary_value=$(printf '%s%s' 'R7qM3vN9xK2p' 'T8cL5sW4')
+fallback_binary_input=$(jq -nc --arg binary "$fallback_binary_value" '
+  {tool_name:"Read",tool_input:{file_path:"image.png"},
+   tool_response:{content:[
+     {type:"image",source:{type:"base64",media_type:"image/png",data:$binary}},
+     {type:"text",text:("PASS" + "WORD=" + "S4fN8qK2vM7xT3pL" + ("z" * 270000))}]}}
+')
+printf '%s' "$fallback_binary_input" \
+  | (cd "$TMP_ROOT" \
+      && PATH="$FAIL_WHOLE_JQ_DIR:$PATH" \
+         AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+         "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+fallback_binary_status=$?
+if [ "$fallback_binary_status" -eq 0 ] \
+   && jq -e --arg binary "$fallback_binary_value" '
+        .hookSpecificOutput.updatedToolOutput.content
+        == [{type:"image",source:{type:"base64",media_type:"image/png",data:$binary}},
+            {type:"text",text:"[REDACTED]"}]
+      ' "$OUT" >/dev/null 2>&1; then
+  ok "portable whole-leaf fallback restores a stripped binary payload exactly"
+else
+  not_ok "portable whole-leaf fallback fails to restore a stripped binary payload (status $fallback_binary_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s' "$fallback_binary_input" \
+  | (cd "$TMP_ROOT" \
+      && PATH="$FAIL_WHOLE_JQ_DIR:$PATH" \
+         AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+         AGENT_GUARD_TEST_FAIL_RESTORE=1 \
+         "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+fallback_restore_failure_status=$?
+if [ "$fallback_restore_failure_status" -eq 0 ] \
+   && jq -e '
+        .hookSpecificOutput.updatedToolOutput.content
+        == [{type:"image",source:{type:"base64",media_type:"image/png",data:""}},
+            {type:"text",text:"[REDACTED]"}]
+      ' "$OUT" >/dev/null 2>&1 \
+   && ! grep -Fq "$fallback_binary_value" "$OUT"; then
+  ok "binary restore failure keeps the stripped payload instead of guessing raw bytes"
+else
+  not_ok "binary restore failure reintroduces or corrupts the stripped payload (status $fallback_restore_failure_status)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+fallback_numeric_response="$TESTTMP/fallback-numeric-response.json"
+awk 'BEGIN {
+  printf "["
+  for (i = 0; i < 480000; i++) {
+    if (i) printf ","
+    printf "9876543210123456,true"
+  }
+  printf "]"
+}' >"$fallback_numeric_response"
+fallback_numeric_started=$(date +%s)
+printf '%s' '{"tool_name":"Read","tool_input":{},"tool_response":[]}' \
+  | (cd "$TMP_ROOT" \
+      && PATH="$FAIL_WHOLE_JQ_DIR:$PATH" \
+         AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+         AGENT_GUARD_TEST_RESPONSE_FILE="$fallback_numeric_response" \
+         "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+fallback_numeric_status=$?
+fallback_numeric_elapsed=$(( $(date +%s) - fallback_numeric_started ))
+if [ "$fallback_numeric_status" -eq 0 ] \
+   && [ "$fallback_numeric_elapsed" -lt 20 ] \
+   && [ "$(jq -s 'length' <"$OUT" 2>/dev/null)" = 1 ] \
+   && jq -e '
+        .hookSpecificOutput.updatedToolOutput as $out
+        | ($out | length) == 960000
+          and $out[0] == 0 and $out[1] == false
+          and $out[959998] == 0 and $out[959999] == false
+      ' "$OUT" >/dev/null 2>&1 \
+   && ! grep -Fq '9876543210123456' "$OUT"; then
+  ok "portable whole-leaf fallback neutralizes an over-cap numeric/boolean response within the hook timeout"
+else
+  not_ok "portable whole-leaf fallback mishandles an over-cap numeric/boolean response (status $fallback_numeric_status, ${fallback_numeric_elapsed}s)"
+  cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+  sed 's/^/  stderr: /' "$ERR"
 fi
 
 # The large-response assignment probe consumes framed leaves. A sanitized value
@@ -8500,6 +11676,327 @@ else
   printf '%s\n' "  cli : $sync_cli" "  hook: $sync_hook"
 fi
 
+# --- PII false positives: digit boundaries, Luhn, octet range -----------------
+# awk has no \b and its gsub cannot veto a match, so Tier-2 detection anchors on
+# non-digit boundaries and validates (Luhn for cards, 0-255 octets for IPv4).
+# Every case runs through all three mirrored sites — the CLI masker
+# (pii_regex_adapter_filter), the hook output masker (mask_pii_response_json)
+# and the mask-mode input gate (pii_tier2_present) — so a drift in one fails.
+pii_cli_mask() { printf '%s' "$1" | "$PLUGIN_ROOT/bin/agent-guard" pii-filter 2>/dev/null; }
+
+pii_hook_mask() { # empty output means the masker left the response unchanged
+  printf '{"tool_name":"Read","tool_input":{"file_path":"m"},"tool_response":%s}' \
+    "$(printf '%s' "$1" | jq -Rs .)" \
+    | (cd "$TMP_ROOT" && AGENT_GUARD_PII_HOOK_MODE=mask "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool 2>/dev/null) \
+    | jq -r '.hookSpecificOutput.updatedToolOutput // empty'
+}
+
+pii_gate_status() { # stderr lands in $ERR so a block can be attributed to the gate
+  printf '{"tool_name":"Write","tool_input":{"file_path":"a.ts","content":%s}}' \
+    "$(printf '%s' "$1" | jq -Rs .)" \
+    | AGENT_GUARD_PII_HOOK_MODE=mask "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool \
+      >/dev/null 2>"$ERR"
+}
+
+# must-pass: ordinary code reaches tools untouched and is not masked on the way out.
+pii_expect_clean() { # $1 label, $2 text
+  fp_cli=$(pii_cli_mask "$2")
+  fp_hook=$(pii_hook_mask "$2")
+  pii_gate_status "$2"
+  fp_gate=$?
+  if [ "$fp_cli" = "$2" ] && [ -z "$fp_hook" ] && [ "$fp_gate" -eq 0 ]; then
+    ok "PII leaves $1 alone (CLI, output masker, input gate)"
+  else
+    not_ok "PII leaves $1 alone (expected unchanged, empty rewrite, exit 0)"
+    printf '%s\n' "  cli : $fp_cli" "  hook: $fp_hook" "  gate: $fp_gate"
+  fi
+}
+
+# must-fail: real Tier-2 PII stays masked on both output paths and blocked on input.
+pii_expect_tier2() { # $1 label, $2 text, $3 expected marker
+  t2_cli=$(pii_cli_mask "$2")
+  t2_hook=$(pii_hook_mask "$2")
+  pii_gate_status "$2"
+  t2_gate=$?
+  # The gate's own message is checked, not just exit 2: another guard blocking
+  # for an unrelated reason would otherwise let this control pass while the
+  # Tier-2 rule is broken.
+  if printf '%s' "$t2_cli" | grep -q "$3" \
+     && printf '%s' "$t2_hook" | grep -q "$3" \
+     && [ "$t2_gate" -eq 2 ] && grep -q 'high-sensitivity PII' "$ERR"; then
+    ok "PII still catches $1 (CLI, output masker, input gate)"
+  else
+    not_ok "PII still catches $1 (expected $3 on both maskers and a Tier-2 gate block)"
+    printf '%s\n' "  cli : $t2_cli" "  hook: $t2_hook" "  gate: $t2_gate"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+}
+
+pii_expect_clean "an epoch-nanosecond timestamp" 'const ts = 1757347200123456789;'
+pii_expect_clean "a Snowflake-style 18-digit id" 'user_id 123456789012345678'
+pii_expect_clean "a Luhn-invalid 16-digit order number" 'order 1234567812345678 shipped'
+pii_expect_clean "out-of-range dotted numbers" 'build 999.888.777.666'
+pii_expect_clean "a 5-part dotted version" 'ver 1.2.3.4.5'
+pii_expect_clean "an SSN shape inside a longer digit run" 'id 5123-45-67890'
+# The generic phone shape is 10-11 digits, so an unseparated numeric id longer
+# than that used to be mangled into [PII:PHONE] plus its leftover digits.
+pii_expect_clean "a 12-digit numeric id" 'id 123456789012'
+pii_expect_clean "an RRN shape inside a longer digit run" 'id 5900101-12345670'
+
+# Card numbers assembled at runtime so this test file holds no contiguous PAN.
+t2_pan16="4111""1111""1111""1111"
+t2_pan19="4111""1111""1111""1111""003"
+t2_amex="3782""822463""10005"
+pii_expect_tier2 "an unseparated 16-digit PAN" "pan $t2_pan16 end" '\[PII:CREDIT_CARD\]'
+pii_expect_tier2 "a 19-digit PAN" "pan $t2_pan19 end" '\[PII:CREDIT_CARD\]'
+pii_expect_tier2 "an unseparated 15-digit Amex" "amex $t2_amex end" '\[PII:CREDIT_CARD\]'
+pii_expect_tier2 "a PAN trailed by a 3-digit number" "pan $t2_pan16 123" '\[PII:CREDIT_CARD\]'
+pii_expect_tier2 "a US SSN" 'ssn 123-45-6789' '\[PII:SSN\]'
+pii_expect_tier2 "a KR resident reg. no." 'rrn 900101-1234567' '\[PII:KR_RRN\]'
+
+# A syntactically valid dotted quad stays masked even when it reads like a build
+# version: 1.2.3.4 is a real IPv4, and no context-free rule separates the two.
+pii_ip_cli=$(pii_cli_mask 'app version 1.2.3.4')
+pii_ip_hook=$(pii_hook_mask 'app version 1.2.3.4')
+if [ "$pii_ip_cli" = 'app version [PII:IP_ADDRESS]' ] \
+   && printf '%s' "$pii_ip_hook" | grep -q '\[PII:IP_ADDRESS\]'; then
+  ok "PII masks a valid dotted quad even in version-like context"
+else
+  not_ok "PII masks a valid dotted quad even in version-like context"
+  printf '%s\n' "  cli : $pii_ip_cli" "  hook: $pii_ip_hook"
+fi
+
+# The Tier-2 gate scans one awk record at a time, so a single long line packed
+# with card-shaped rejects is the worst case: every candidate re-examines the
+# rest of the record. It has to clear the PreToolUse timeout in
+# plugins/agent-guard/hooks/hooks.json (10s) — past that the host kills the hook
+# and the input is neither cleared nor reported as a detector failure.
+PII_BIG="$TMP_ROOT/pii-big-line.txt"
+awk 'BEGIN { for (i = 0; i < 14700; i++) printf "1234567812345678 " }' > "$PII_BIG"
+printf '{"session_id":"t","tool_name":"Write","tool_input":{"file_path":"a.ts","content":%s}}' \
+  "$(jq -Rs . < "$PII_BIG")" > "$TMP_ROOT/pii-big-payload.json"
+pii_big_start=$(date +%s)
+AGENT_GUARD_PII_HOOK_MODE=mask "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool \
+  < "$TMP_ROOT/pii-big-payload.json" >/dev/null 2>"$ERR"
+status=$?
+pii_big_elapsed=$(( $(date +%s) - pii_big_start ))
+if [ "$status" -eq 0 ] && [ "$pii_big_elapsed" -lt 10 ]; then
+  ok "PII gate clears a 250 KB single-line record within the PreToolUse timeout (${pii_big_elapsed}s)"
+else
+  not_ok "PII gate clears a 250 KB single-line record within the PreToolUse timeout (exit $status, ${pii_big_elapsed}s)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# --- AGENT_GUARD_PII_SKIP (per-type Tier-1 opt-out) --------------------------
+# Tier-1 masking is output-only and never hard-blocks an input, so switching a
+# type off cannot weaken the input gate. Tier-2 names are refused outright: that
+# gate is fail-closed and must not be turned off from the environment.
+pii_skip_cli() { # $1 skip set, $2 text
+  printf '%s' "$2" \
+    | env AGENT_GUARD_PII_SKIP="$1" "$PLUGIN_ROOT/bin/agent-guard" pii-filter 2>/dev/null
+}
+
+pii_skip_hook() { # $1 skip set, $2 text
+  printf '{"tool_name":"Read","tool_input":{"file_path":"m"},"tool_response":%s}' \
+    "$(printf '%s' "$2" | jq -Rs .)" \
+    | (cd "$TMP_ROOT" && env AGENT_GUARD_PII_SKIP="$1" AGENT_GUARD_PII_HOOK_MODE=mask \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool 2>/dev/null) \
+    | jq -r '.hookSpecificOutput.updatedToolOutput // empty'
+}
+
+pii_skip_gate() { # $1 skip set, $2 hook mode, $3 content
+  printf '{"tool_name":"Write","tool_input":{"file_path":"a.ts","content":%s}}' \
+    "$(printf '%s' "$3" | jq -Rs .)" \
+    | env AGENT_GUARD_PII_SKIP="$1" AGENT_GUARD_PII_HOOK_MODE="$2" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >/dev/null 2>"$ERR"
+}
+
+SKIP_SAMPLE='mail x@y.io ip 8.8.8.8 mob 010-1234-5678'
+
+# One type off: that type survives, the other Tier-1 types still mask, and the
+# CLI adapter and the hook output masker still agree character for character.
+skip_cli=$(pii_skip_cli IP_ADDRESS "$SKIP_SAMPLE")
+skip_hook=$(pii_skip_hook IP_ADDRESS "$SKIP_SAMPLE")
+if [ "$skip_cli" = 'mail [PII:EMAIL] ip 8.8.8.8 mob [PII:PHONE]' ] \
+   && [ "$skip_cli" = "$skip_hook" ]; then
+  ok "PII skip IP_ADDRESS keeps IPv4 and both maskers stay in sync"
+else
+  not_ok "PII skip IP_ADDRESS keeps IPv4 and both maskers stay in sync"
+  printf '%s\n' "  cli : $skip_cli" "  hook: $skip_hook"
+fi
+
+skip_cli=$(pii_skip_cli 'IP_ADDRESS,PHONE' "$SKIP_SAMPLE")
+skip_hook=$(pii_skip_hook 'IP_ADDRESS,PHONE' "$SKIP_SAMPLE")
+if [ "$skip_cli" = 'mail [PII:EMAIL] ip 8.8.8.8 mob 010-1234-5678' ] \
+   && [ "$skip_cli" = "$skip_hook" ]; then
+  ok "PII skip accepts a comma-separated list"
+else
+  not_ok "PII skip accepts a comma-separated list"
+  printf '%s\n' "  cli : $skip_cli" "  hook: $skip_hook"
+fi
+
+# Unset and empty are the same thing: mask everything.
+skip_cli=$(pii_skip_cli '' "$SKIP_SAMPLE")
+if [ "$skip_cli" = 'mail [PII:EMAIL] ip [PII:IP_ADDRESS] mob [PII:PHONE]' ]; then
+  ok "PII skip empty masks every type"
+else
+  not_ok "PII skip empty masks every type"
+  printf '%s\n' "  cli : $skip_cli"
+fi
+
+# Skipping a Tier-1 type must not touch Tier-2 masking or the input gate.
+skip_cli=$(pii_skip_cli 'IP_ADDRESS,PHONE,EMAIL' 'ssn 123-45-6789 rrn 900101-1234567')
+if [ "$skip_cli" = 'ssn [PII:SSN] rrn [PII:KR_RRN]' ]; then
+  ok "PII skip leaves Tier-2 masking untouched"
+else
+  not_ok "PII skip leaves Tier-2 masking untouched"
+  printf '%s\n' "  cli : $skip_cli"
+fi
+
+pii_skip_gate 'IP_ADDRESS,PHONE,EMAIL' mask 'ssn 123-45-6789'
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'high-sensitivity PII' "$ERR"; then
+  ok "PII skip cannot disable the Tier-2 input hard-block"
+else
+  not_ok "PII skip cannot disable the Tier-2 input hard-block (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# block mode blocks ANY PII, and it derives that from the masker — so a skipped
+# type stops blocking there too. That is the documented consequence, not a leak:
+# the type is no longer treated as PII at all.
+pii_skip_gate IP_ADDRESS block 'ip 8.8.8.8'
+status=$?
+if [ "$status" -eq 0 ]; then
+  ok "PII skip IP_ADDRESS also stops block mode from blocking an IPv4 input"
+else
+  not_ok "PII skip IP_ADDRESS also stops block mode from blocking an IPv4 input (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+pii_skip_gate IP_ADDRESS block 'mail x@y.io'
+status=$?
+if [ "$status" -eq 2 ]; then
+  ok "PII skip IP_ADDRESS leaves block mode blocking other Tier-1 PII"
+else
+  not_ok "PII skip IP_ADDRESS leaves block mode blocking other Tier-1 PII (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# A Tier-2 name is refused loudly rather than silently ignored: a user who wrote
+# it is expecting cards to pass, and must be told the knob does not do that.
+for skip_bad in CREDIT_CARD SSN KR_RRN BOGUS ip_address; do
+  printf '%s' 'x' \
+    | env AGENT_GUARD_PII_SKIP="$skip_bad" "$PLUGIN_ROOT/bin/agent-guard" pii-filter \
+      >/dev/null 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 2 ] && grep -q 'AGENT_GUARD_PII_SKIP' "$ERR"; then
+    ok "PII skip rejects $skip_bad"
+  else
+    not_ok "PII skip rejects $skip_bad (expected 2, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+# The same refusal must reach every hook, not just the CLI — a hook that
+# swallowed it would silently mask (or not mask) against the user's intent.
+pii_skip_gate CREDIT_CARD mask 'const n = 42;'
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'AGENT_GUARD_PII_SKIP' "$ERR"; then
+  ok "PII skip rejection reaches hook-pre-tool"
+else
+  not_ok "PII skip rejection reaches hook-pre-tool (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s' '{"tool_name":"Read","tool_input":{"file_path":"m"},"tool_response":"x"}' \
+  | env AGENT_GUARD_PII_SKIP=CREDIT_CARD AGENT_GUARD_PII_HOOK_MODE=mask \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >/dev/null 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'AGENT_GUARD_PII_SKIP' "$ERR"; then
+  ok "PII skip rejection reaches hook-post-tool"
+else
+  not_ok "PII skip rejection reaches hook-post-tool (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '{"session_id":"t","prompt":"hello"}' \
+  | env AGENT_GUARD_PII_SKIP=CREDIT_CARD AGENT_GUARD_PII_HOOK_MODE=mask \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-user-prompt >/dev/null 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'AGENT_GUARD_PII_SKIP' "$ERR"; then
+  ok "PII skip rejection reaches hook-user-prompt"
+else
+  not_ok "PII skip rejection reaches hook-user-prompt (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# An endpoint provider redacts server-side and never receives the skip set, so
+# accepting one would leave a switch that silently does nothing on every path
+# that goes through the provider (CLI, exec, and block-mode input gating).
+for skip_prov in http pleno; do
+  printf '%s' 'x' \
+    | env AGENT_GUARD_PII_SKIP=IP_ADDRESS AGENT_GUARD_PII_PROVIDER="$skip_prov" \
+      AGENT_GUARD_PII_REDACT_URL=http://127.0.0.1:1 \
+      "$PLUGIN_ROOT/bin/agent-guard" pii-filter >/dev/null 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 2 ] && grep -q 'AGENT_GUARD_PII_SKIP' "$ERR"; then
+    ok "PII skip is refused with the $skip_prov provider"
+  else
+    not_ok "PII skip is refused with the $skip_prov provider (want exit 2 naming AGENT_GUARD_PII_SKIP, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+# …and an empty skip set must leave endpoint providers exactly as they were:
+# reaching the request (and failing on the unreachable URL) proves the new
+# validation did not start rejecting a configuration that used to work.
+printf '%s' 'x' \
+  | env AGENT_GUARD_PII_PROVIDER=http AGENT_GUARD_PII_REDACT_URL=http://127.0.0.1:1 \
+    "$PLUGIN_ROOT/bin/agent-guard" pii-filter >/dev/null 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'provider request failed' "$ERR"; then
+  ok "an empty PII skip set leaves endpoint providers untouched"
+else
+  not_ok "an empty PII skip set leaves endpoint providers untouched (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# --check is the health check people run to validate their configuration, so it
+# must refuse a skip set that every real run would refuse.
+env AGENT_GUARD_PII_SKIP=CREDIT_CARD "$PLUGIN_ROOT/bin/agent-guard" pii-filter --check \
+  >/dev/null 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'AGENT_GUARD_PII_SKIP' "$ERR"; then
+  ok "PII skip rejection reaches pii-filter --check"
+else
+  not_ok "PII skip rejection reaches pii-filter --check (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# exec pipes the masker with stderr suppressed, so only the up-front validation
+# in its main shell can surface a bad skip set — without it the run would just
+# quietly leave the output unmasked.
+env AGENT_GUARD_PII_SKIP=CREDIT_CARD AGENT_GUARD_PII_HOOK_MODE=mask \
+  "$PLUGIN_ROOT/bin/agent-guard" exec -- printf 'x\n' >/dev/null 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'AGENT_GUARD_PII_SKIP' "$ERR"; then
+  ok "PII skip rejection reaches agent-guard exec"
+else
+  not_ok "PII skip rejection reaches agent-guard exec (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# exec masks through the same adapter, so a skipped type must survive there too.
+skip_exec=$(env AGENT_GUARD_PII_SKIP=IP_ADDRESS AGENT_GUARD_PII_HOOK_MODE=mask \
+  "$PLUGIN_ROOT/bin/agent-guard" exec -- printf 'ip 8.8.8.8 mail x@y.io\n' 2>/dev/null)
+if [ "$skip_exec" = 'ip 8.8.8.8 mail [PII:EMAIL]' ]; then
+  ok "PII skip applies to agent-guard exec output"
+else
+  not_ok "PII skip applies to agent-guard exec output"
+  printf '%s\n' "  out : $skip_exec"
+fi
+
 # --- agent-guard exec (shell-escape output masking) --------------------------
 # `agent-guard exec` runs a command and masks secret-like values in its captured
 # output before printing. Secret VALUE assembled at runtime from fragments so this
@@ -8507,6 +12004,28 @@ fi
 EXEC_KEY='to''ken='
 EXEC_VAL='abcd1234efgh5678ijkl9012mnop3456'
 EXEC_LINE="${EXEC_KEY}${EXEC_VAL}"
+
+EXEC_PLACEHOLDERS=$(printf '%s\n%s\n%s\n%s' \
+  'API_KEY=example_token' 'TOKEN="Example-Key"' \
+  'CLIENT_SECRET=DUMMY_SECRET' 'PASSWORD=not-a-real-password')
+exec_out=$("$PLUGIN_ROOT/bin/agent-guard" exec -- \
+  printf '%s' "$EXEC_PLACEHOLDERS" 2>/dev/null)
+if [ "$exec_out" = "$EXEC_PLACEHOLDERS" ]; then
+  ok "exec leaves exact documentation placeholders visible"
+else
+  not_ok "exec leaves exact documentation placeholders visible"
+  printf '%s\n' "$exec_out" | sed 's/^/  out: /'
+fi
+
+EXEC_PLACEHOLDER_LOOKALIKE='API_KEY=example_token_value_long'
+exec_out=$("$PLUGIN_ROOT/bin/agent-guard" exec -- \
+  printf '%s' "$EXEC_PLACEHOLDER_LOOKALIKE" 2>/dev/null)
+if [ "$exec_out" = 'API_KEY=[REDACTED]' ]; then
+  ok "exec still masks a decorated placeholder lookalike"
+else
+  not_ok "exec still masks a decorated placeholder lookalike"
+  printf '%s\n' "$exec_out" | sed 's/^/  out: /'
+fi
 
 exec_out=$("$PLUGIN_ROOT/bin/agent-guard" exec -- printf '%s\n' "$EXEC_LINE" 2>/dev/null)
 if printf '%s' "$exec_out" | grep -q '\[REDACTED\]' \
@@ -9277,8 +12796,8 @@ fi
 
 # --- shell-init Claude command wrapping (stable, default-on overrides) --------
 # The default snippet overrides cat/head/printenv inside Claude Code. A durable
-# opt-out omits those functions. The 1.x compatibility flags are removed in
-# 4.0 and rejected outright (asserted below).
+# opt-out omits those functions. The 1.x compatibility flags were removed in
+# v3.1.0 (#167) and are rejected outright (asserted below).
 shellinit_wrap=$shellinit_auto
 if printf '%s' "$shellinit_wrap" | grep -q '__agentguard_wrap_command'; then
   ok "shell-init enables Claude command wrapping by default"
@@ -9291,7 +12810,7 @@ if printf '%s' "$shellinit_no_wrap" | grep -q '__agentguard_wrap_command'; then
 else
   ok "shell-init --no-command-wrapping omits automatic command overrides"
 fi
-# The 1.x flags are removed in 4.0: shell-init must REJECT them (exit 2, no
+# The 1.x flags were removed in v3.1.0 (#167): shell-init must REJECT them (exit 2, no
 # snippet) so a stale 1.x rc line fails loudly at eval time instead of being
 # silently reinterpreted. --definitely-unknown pins the same fix for the
 # pre-existing swallow: die inside the target substitution used to warn but
@@ -9863,7 +13382,7 @@ if grep -q 'shell-init --no-command-wrapping' "$ss_off" 2>/dev/null; then
 else
   not_ok "setup-shell persists the command-wrapping opt-out"
 fi
-# The 1.x flags are removed in 4.0: setup-shell must REJECT them and must not
+# The 1.x flags were removed in v3.1.0 (#167): setup-shell must REJECT them and must not
 # write an rc. must-fail control below: the supported opt-out flag still works.
 for ss_v1_flag in --claude-bang-guard --experimental-bang-guard; do
   ss_v1="$TESTTMP/setup-v1-${ss_v1_flag#--}.rc"
@@ -9903,10 +13422,12 @@ else
 fi
 # Self-healing invocation: the rc line prefers the stable absolute path and
 # keeps an output-checked PATH fallback for standalone installs.
+run_expect 0 "shell startup respects selected current before cached versions" \
+  sh "$ROOT/tests/shell-cache-authority.sh"
 ss_heal="$TESTTMP/setup-heal.rc"
 "$PLUGIN_ROOT/bin/agent-guard" setup-shell --rc "$ss_heal" >/dev/null 2>&1
 if grep -q '_agbin=' "$ss_heal" 2>/dev/null \
-   && grep -Fq '_agi=$("$_agbin" shell-init' "$ss_heal" 2>/dev/null \
+   && grep -Fq '_agi=$("$_agresolved" shell-init' "$ss_heal" 2>/dev/null \
    && grep -q 'command -v agent-guard' "$ss_heal" 2>/dev/null; then
   ok "setup-shell bakes the stable invocation with resolver fallbacks"
 else
@@ -10003,7 +13524,7 @@ if printf '%s' "$ss_fish_out" | grep -q 'fish' \
    && printf '%s' "$ss_fish_out" | grep -q 'agx' \
    && printf '%s' "$ss_fish_out" | grep -q 'plugin-only' \
    && printf '%s' "$ss_fish_out" | grep -q 'fish executable:' \
-   && grep -Fq 'current/bin/agent-guard' "$ROOT/README.md" \
+   && grep -Fq 'current/bin/agent-guard' "$ROOT/docs/operations.md" \
    && ! printf '%s' "$ss_fish_out" | grep -Eq 'Claude Code|Codex'; then
   ok "setup-shell reports the fish limitation and plugin-only executable (#139)"
 else
@@ -10122,13 +13643,23 @@ fi
 # Model the host cache layout without touching the real HOME. The first plugin
 # execution creates `current`, setup-shell writes only that stable path, and an
 # upgrade retargets it before the old version directory disappears.
+install_cache_payload() {
+  cache_base=$1
+  cache_version=$2
+  cache_root="$cache_base/$cache_version"
+  mkdir -p "$cache_root/bin"
+  sed "s/^VERSION=.*/VERSION=$cache_version/" \
+    "$PLUGIN_ROOT/bin/agent-guard" >"$cache_root/bin/agent-guard"
+  chmod +x "$cache_root/bin/agent-guard"
+  cp -R "$PLUGIN_ROOT/config" "$cache_root/config"
+}
+
 CLEAN_HOME="$TESTTMP/clean-home"
 CLEAN_CACHE="$CLEAN_HOME/.claude/plugins/cache/agent-guard/agent-guard"
 CLEAN_RC="$CLEAN_HOME/.zshrc"
-mkdir -p "$CLEAN_CACHE/3.0.0/bin"
+mkdir -p "$CLEAN_CACHE"
 CLEAN_CACHE=$(CDPATH= cd -- "$CLEAN_CACHE" && pwd -P)
-cp "$PLUGIN_ROOT/bin/agent-guard" "$CLEAN_CACHE/3.0.0/bin/agent-guard"
-chmod +x "$CLEAN_CACHE/3.0.0/bin/agent-guard"
+install_cache_payload "$CLEAN_CACHE" 3.0.0
 HOME="$CLEAN_HOME" "$CLEAN_CACHE/3.0.0/bin/agent-guard" version >/dev/null 2>&1
 HOME="$CLEAN_HOME" "$CLEAN_CACHE/3.0.0/bin/agent-guard" setup-shell --rc "$CLEAN_RC" >/dev/null 2>&1
 if [ "$(readlink "$CLEAN_CACHE/current" 2>/dev/null)" = 3.0.0 ]; then
@@ -10143,9 +13674,7 @@ else
   not_ok "setup-shell records only the stable plugin path"
 fi
 
-mkdir -p "$CLEAN_CACHE/3.0.1/bin"
-cp "$PLUGIN_ROOT/bin/agent-guard" "$CLEAN_CACHE/3.0.1/bin/agent-guard"
-chmod +x "$CLEAN_CACHE/3.0.1/bin/agent-guard"
+install_cache_payload "$CLEAN_CACHE" 3.0.1
 HOME="$CLEAN_HOME" "$CLEAN_CACHE/3.0.1/bin/agent-guard" version >/dev/null 2>&1
 rm -rf "$CLEAN_CACHE/3.0.0"
 if [ "$(readlink "$CLEAN_CACHE/current" 2>/dev/null)" = 3.0.1 \
@@ -10168,18 +13697,24 @@ else
 fi
 
 # A stale version may still be executing in an old session after a newer plugin
-# is installed. It must not roll `current` backward, and non-numeric lookalike
-# directories must never win the resolver sort.
-mkdir -p "$CLEAN_CACHE/3.0.0/bin" "$CLEAN_CACHE/3.0.2/bin" "$CLEAN_CACHE/9.9.9beta/bin"
-for clean_version in 3.0.0 3.0.2 9.9.9beta; do
-  cp "$PLUGIN_ROOT/bin/agent-guard" "$CLEAN_CACHE/$clean_version/bin/agent-guard"
-  chmod +x "$CLEAN_CACHE/$clean_version/bin/agent-guard"
-done
+# is merely cached. It must not roll `current` backward, but the unselected
+# higher sibling must not activate until its own host-selected binary runs.
+install_cache_payload "$CLEAN_CACHE" 3.0.0
+install_cache_payload "$CLEAN_CACHE" 3.0.2
+mkdir -p "$CLEAN_CACHE/9.9.9beta/bin"
+cp "$PLUGIN_ROOT/bin/agent-guard" "$CLEAN_CACHE/9.9.9beta/bin/agent-guard"
+chmod +x "$CLEAN_CACHE/9.9.9beta/bin/agent-guard"
 HOME="$CLEAN_HOME" "$CLEAN_CACHE/3.0.0/bin/agent-guard" version >/dev/null 2>&1
-if [ "$(readlink "$CLEAN_CACHE/current" 2>/dev/null)" = 3.0.2 ]; then
-  ok "stale binaries keep current on the highest strictly numeric installed version"
+if [ "$(readlink "$CLEAN_CACHE/current" 2>/dev/null)" = 3.0.1 ]; then
+  ok "stale binaries preserve the newer active current without activating cached siblings"
 else
-  not_ok "stale binary does not roll current backward (got: $(readlink "$CLEAN_CACHE/current" 2>/dev/null))"
+  not_ok "stale binary preserves the newer active current (got: $(readlink "$CLEAN_CACHE/current" 2>/dev/null))"
+fi
+HOME="$CLEAN_HOME" "$CLEAN_CACHE/3.0.2/bin/agent-guard" version >/dev/null 2>&1
+if [ "$(readlink "$CLEAN_CACHE/current" 2>/dev/null)" = 3.0.2 ]; then
+  ok "running the host-selected newer plugin advances the stable current link"
+else
+  not_ok "host-selected newer plugin advances current (got: $(readlink "$CLEAN_CACHE/current" 2>/dev/null))"
 fi
 
 # --- temp cleanup on abrupt termination (#131) -----------------------------
@@ -10208,6 +13743,7 @@ SIG_GL="$SIGTMP/gitleaks"
 cat >"$SIG_GL" <<EOSH
 #!/usr/bin/env sh
 case "\${1:-}" in
+  version) printf '%s\n' '8.30.1-signal-fixture'; exit 0 ;;
   stdin) : >"$SIG_READY"; sleep 3; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -10273,6 +13809,317 @@ else
   not_ok "normal hook completion leaves no leftover scan temp: $norm_leftover"
 fi
 rm -rf "$NORM_PARENT"
+
+# --- pilot security: bounded tree scans and Codex write targets ------------
+# Assemble the test-only sentinel so source scans never see the matched value.
+PILOT_TOKEN_PART_1="AGENT_GUARD_TEST_"
+PILOT_TOKEN_PART_2="SECRET"
+PILOT_TOKEN=$(printf '%s%s' "$PILOT_TOKEN_PART_1" "$PILOT_TOKEN_PART_2")
+PILOT_REPO="$TMP_ROOT/pilot-security-repo"
+mkdir -p "$PILOT_REPO/ignored dir"
+(
+  cd "$PILOT_REPO" || exit 2
+  git init -q
+  git config user.email test@example.com
+  git config user.name "Agent Guard Tests"
+  printf '%s\n' '*.bin -diff' >.gitattributes
+  printf '%s\n' clean >payload.bin
+  printf '%s\n' 'ignored dir/' >.gitignore
+  git add .gitattributes .gitignore payload.bin
+  git commit -q -m init
+  printf 'TOKEN=%s\n' "$PILOT_TOKEN" >payload.bin
+  "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+) >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 1 ]; then
+  ok "scan-working-tree scans tracked files marked binary and -diff"
+else
+  not_ok "scan-working-tree scans tracked -diff content (expected 1, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Preserve a confirmed tracked finding even when the later untracked listing
+# is unavailable. The fake delegates every Git operation except ls-files.
+PILOT_FAIL_BIN="$TMP_ROOT/pilot-fail-ls-files"
+mkdir -p "$PILOT_FAIL_BIN"
+cat >"$PILOT_FAIL_BIN/git" <<'EOSH'
+#!/usr/bin/env sh
+for arg do
+  [ "$arg" = ls-files ] && exit 71
+done
+exec "$AGENT_GUARD_TEST_REAL_GIT" "$@"
+EOSH
+chmod +x "$PILOT_FAIL_BIN/git"
+(
+  cd "$PILOT_REPO" || exit 2
+  PATH="$PILOT_FAIL_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+) >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 1 ]; then
+  ok "scan-working-tree keeps a finding when a later scan is unavailable"
+else
+  not_ok "scan-working-tree finding outranks unavailable (expected 1, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(cd "$PILOT_REPO" && git checkout -q -- payload.bin)
+
+# The precedence is symmetric: a later confirmed untracked finding must replace
+# an earlier unavailable tracked-diff result.
+printf '%s\n' "$PILOT_TOKEN" >"$PILOT_REPO/untracked-finding.txt"
+PILOT_FAIL_DIFF_BIN="$TMP_ROOT/pilot-fail-diff"
+mkdir -p "$PILOT_FAIL_DIFF_BIN"
+cat >"$PILOT_FAIL_DIFF_BIN/git" <<'EOSH'
+#!/usr/bin/env sh
+for arg do
+  [ "$arg" = diff ] && exit 72
+done
+exec "$AGENT_GUARD_TEST_REAL_GIT" "$@"
+EOSH
+chmod +x "$PILOT_FAIL_DIFF_BIN/git"
+(
+  cd "$PILOT_REPO" || exit 2
+  PATH="$PILOT_FAIL_DIFF_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+) >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 1 ]; then
+  ok "scan-working-tree keeps an untracked finding after an earlier unavailable diff"
+else
+  not_ok "scan-working-tree later finding outranks unavailable (expected 1, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+rm -f "$PILOT_REPO/untracked-finding.txt"
+
+# A failed repository scan cannot be used as proof that Git covered the path;
+# PostToolUse must directly inspect the named tracked target instead.
+printf '%s\n' "$PILOT_TOKEN" >"$PILOT_REPO/payload.bin"
+failed_backstop_payload=$(jq -nc --arg d "$PILOT_REPO" \
+  '{session_id:"pilot-failed-backstop",tool_name:"Write",cwd:$d,tool_input:{file_path:"payload.bin"}}')
+printf '%s' "$failed_backstop_payload" \
+  | PATH="$PILOT_FAIL_DIFF_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+      AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ]; then
+  ok "hook-post-tool directly scans a tracked target after Git backstop failure"
+else
+  not_ok "failed Git backstop does not claim target coverage (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(cd "$PILOT_REPO" && git checkout -q -- payload.bin)
+
+# A producer that exceeds its third of the aggregate tree-scan budget is an
+# infrastructure result, never an empty clean diff.
+PILOT_BIG_BIN="$TMP_ROOT/pilot-big-diff"
+mkdir -p "$PILOT_BIG_BIN"
+cat >"$PILOT_BIG_BIN/git" <<'EOSH'
+#!/usr/bin/env sh
+for arg do
+  if [ "$arg" = diff ]; then
+    printf '%s\n' 'diff --git a/x b/x' '--- a/x' '+++ b/x' '@@ -0,0 +1 @@'
+    yes '+012345678901234567890123456789012345678901234567890123456789'
+    exit 0
+  fi
+done
+exec "$AGENT_GUARD_TEST_REAL_GIT" "$@"
+EOSH
+chmod +x "$PILOT_BIG_BIN/git"
+(
+  cd "$PILOT_REPO" || exit 2
+  PATH="$PILOT_BIG_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree
+) >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 3 ]; then
+  ok "scan-working-tree reports an over-budget diff as unavailable"
+else
+  not_ok "scan-working-tree over-budget diff is unavailable (expected 3, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Codex apply_patch may write several files, uses the event cwd for relative
+# names, and permits spaces and shell metacharacters in its line-based paths.
+printf 'TOKEN=%s\n' "$PILOT_TOKEN" >"$PILOT_REPO/ignored dir/clean name.txt"
+printf 'TOKEN=%s\n' "$PILOT_TOKEN" >"$PILOT_REPO/ignored dir/semi;name.txt"
+pilot_patch=$(printf '%s\n' \
+  '*** Begin Patch' \
+  '*** Add File: ignored dir/clean name.txt' \
+  '+clean' \
+  '*** Add File: ignored dir/semi;name.txt' \
+  '+clean' \
+  '*** End Patch')
+pilot_payload=$(jq -nc --arg p "$pilot_patch" --arg d "$PILOT_REPO" \
+  '{session_id:"pilot-apply-multi",tool_name:"apply_patch",cwd:$d,tool_input:{input:$p}}')
+printf '%s' "$pilot_payload" \
+  | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ]; then
+  ok "Codex apply_patch directly scans multiple safe relative targets from payload cwd"
+else
+  not_ok "Codex apply_patch scans every target (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Large tracked files whose tiny changes were successfully covered by the Git
+# diff do not consume the separate direct-scan budget. Their full sizes exceed
+# 10 MiB together, while the actual added-line diff stays small.
+LARGE_PATCH_REPO="$TMP_ROOT/large-patch-targets"
+mkdir -p "$LARGE_PATCH_REPO"
+(
+  cd "$LARGE_PATCH_REPO" || exit 2
+  git init -q
+  git config user.email test@example.com
+  git config user.name "Agent Guard Tests"
+  yes 'clean line' | head -c 5767168 >large-a.txt
+  yes 'clean line' | head -c 5767168 >large-b.txt
+  git add large-a.txt large-b.txt
+  git commit -q -m large-base
+  printf '\nsmall clean edit\n' >>large-a.txt
+  printf '\nsmall clean edit\n' >>large-b.txt
+)
+large_patch=$(printf '%s\n' \
+  '*** Begin Patch' \
+  '*** Update File: large-a.txt' \
+  '@@' \
+  '+small clean edit' \
+  '*** Update File: large-b.txt' \
+  '@@' \
+  '+small clean edit' \
+  '*** End Patch')
+large_payload=$(jq -nc --arg p "$large_patch" --arg d "$LARGE_PATCH_REPO" \
+  '{session_id:"large-tracked-patch",tool_name:"apply_patch",cwd:$d,tool_input:{patch:$p}}')
+printf '%s' "$large_payload" \
+  | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ]; then
+  ok "apply_patch excludes successfully Git-covered tracked files from direct-scan budget"
+else
+  not_ok "large tracked files with tiny covered diffs pass closed policy (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Once those paths are ignored and untracked, Git no longer covers them; their
+# aggregate full size must still take the direct-scan infrastructure path.
+(
+  cd "$LARGE_PATCH_REPO" || exit 2
+  git checkout -q -- large-a.txt large-b.txt
+  printf '%s\n' 'large-*.txt' >.gitignore
+  git rm -q --cached large-a.txt large-b.txt
+  git add .gitignore
+  git commit -q -m ignored-large
+  printf '\nsmall clean edit\n' >>large-a.txt
+  printf '\nsmall clean edit\n' >>large-b.txt
+)
+large_ignored_payload=$(printf '%s' "$large_payload" | jq -c '.session_id="large-ignored-patch"')
+printf '%s' "$large_ignored_payload" \
+  | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'direct-scan targets exceed the scan input limit' "$ERR"; then
+  ok "apply_patch still caps ignored targets that require direct scanning"
+else
+  not_ok "large ignored apply_patch targets follow closed direct-scan budget policy (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# A failed Git scan cannot claim coverage either. Open policy continues to the
+# direct path, where the same aggregate cap is still applied and reported.
+(
+  cd "$LARGE_PATCH_REPO" || exit 2
+  git add -f large-a.txt large-b.txt
+  git commit -q -m retrack-large
+  printf '\nsmall clean edit two\n' >>large-a.txt
+  printf '\nsmall clean edit two\n' >>large-b.txt
+)
+large_failed_payload=$(printf '%s' "$large_payload" | jq -c '.session_id="large-failed-backstop"')
+printf '%s' "$large_failed_payload" \
+  | PATH="$PILOT_FAIL_DIFF_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+      AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=open \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/large-failed-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ] && grep -q 'direct-scan targets exceed the scan input limit' "$ERR"; then
+  ok "apply_patch still caps tracked targets after the Git backstop fails"
+else
+  not_ok "failed Git backstop cannot exempt large direct targets (expected open status 0 plus cap, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+malformed_patch='*** Begin Patch
+*** Add File:
++clean
+*** End Patch'
+malformed_payload=$(jq -nc --arg p "$malformed_patch" --arg d "$PILOT_REPO" \
+  '{session_id:"pilot-apply-malformed",tool_name:"apply_patch",cwd:$d,tool_input:{patch:$p}}')
+printf '%s' "$malformed_payload" \
+  | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ]; then
+  ok "Codex apply_patch malformed write target follows closed infrastructure policy"
+else
+  not_ok "Codex apply_patch malformed target is not silently clean (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+many_patch='*** Begin Patch'
+many_i=0
+while [ "$many_i" -lt 129 ]; do
+  many_i=$((many_i + 1))
+  many_patch="$many_patch
+*** Add File: ignored dir/empty-$many_i
++clean"
+done
+many_patch="$many_patch
+*** End Patch"
+many_payload=$(jq -nc --arg p "$many_patch" --arg d "$PILOT_REPO" \
+  '{session_id:"pilot-apply-count",tool_name:"apply_patch",cwd:$d,tool_input:{diff:$p}}')
+printf '%s' "$many_payload" \
+  | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ]; then
+  ok "Codex apply_patch target count limit follows closed infrastructure policy"
+else
+  not_ok "Codex apply_patch bounds empty target count (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+newline_payload=$(jq -nc --arg d "$PILOT_REPO" --arg p "ignored dir/trailing
+" '{session_id:"pilot-newline-target",tool_name:"Write",cwd:$d,tool_input:{file_path:$p}}')
+printf '%s' "$newline_payload" \
+  | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ]; then
+  ok "structured Write target with a trailing newline is not silently treated as another path"
+else
+  not_ok "structured Write control-character target follows infrastructure policy (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+printf '%s\n' clean >"$PILOT_REPO/ignored dir/normal.txt"
+normal_payload=$(jq -nc --arg d "$PILOT_REPO" \
+  '{session_id:"pilot-normal-target",tool_name:"Write",cwd:$d,tool_input:{file_path:"ignored dir/normal.txt"}}')
+printf '%s' "$normal_payload" \
+  | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/post-target-warn" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 0 ]; then
+  ok "structured Write normal target passes under closed infrastructure policy"
+else
+  not_ok "structured Write normal target is not a control-character false positive (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
 
 say "passed: $pass"
 say "failed: $fail"

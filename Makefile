@@ -1,7 +1,7 @@
 # Agent Guard — discoverability layer for the existing scripts.
 # Each target is a thin pass-through to install.sh or plugins/agent-guard/bin/agent-guard.
 
-.PHONY: help check install test smoke-test bench scan scan-staged checksum submission-check submission-artifact
+.PHONY: help check install test test-pleno-integration smoke-test bench scan scan-staged checksum formula submission-check submission-artifact
 
 help:
 	@printf 'Agent Guard — make targets\n'
@@ -10,12 +10,14 @@ help:
 	@printf '  make check         Verify deps and print installed gitleaks version.\n'
 	@printf '  make install       Configure the native git pre-commit hook.\n'
 	@printf '  make test          Run the test suite (uses a mock gitleaks).\n'
+	@printf '  make test-pleno-integration  Run opt-in tests against a real pleno endpoint.\n'
 	@printf '  make smoke-test    Run real git/jq/gitleaks end-to-end checks.\n'
 	@printf '  make bench         Run the leak-prevention channel-coverage benchmark (real gitleaks).\n'
 	@printf '  make scan          Scan the working tree for secrets.\n'
 	@printf '  make scan-staged   Scan staged changes only.\n'
 	@printf '  make checksum [VERSION=X.Y.Z]   Fetch gitleaks-checksum for every supported OS/arch (CI typically picks linux/x64).\n'
-	@printf '  make submission-check  Validate stable marketplace submission documentation and metadata.\n'
+	@printf '  make formula VERSION=X.Y.Z SHA=<tarball-sha256>  Render a Homebrew formula for a tap.\n'
+	@printf '  make submission-check  Validate plugin disclosures and marketplace metadata.\n'
 	@printf '  make submission-artifact SHA=<merged-main-sha>  Render an optional SHA-pinned marketplace entry.\n'
 
 check:
@@ -26,6 +28,9 @@ install:
 
 test:
 	@tests/run.sh
+
+test-pleno-integration:
+	@tests/run-pleno-integration.sh
 
 smoke-test:
 	@plugins/agent-guard/bin/agent-guard smoke-test
@@ -41,6 +46,9 @@ scan-staged:
 
 checksum:
 	@sh plugins/agent-guard/scripts/gitleaks-checksum.sh $(VERSION)
+
+formula:
+	@sh scripts/render-homebrew-formula.sh $(VERSION) $(SHA)
 
 submission-check:
 	@scripts/validate-submission-readiness.sh

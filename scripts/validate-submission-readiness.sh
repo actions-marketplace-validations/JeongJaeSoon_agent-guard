@@ -3,7 +3,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 PLUGIN="$ROOT/plugins/agent-guard"
-ENTRY="$ROOT/docs/submission/marketplace-entry.template.json"
+ENTRY="$ROOT/scripts/marketplace-entry.template.json"
 
 failures=0
 
@@ -52,7 +52,6 @@ done
 require_json "$PLUGIN/.claude-plugin/plugin.json"
 require_json "$PLUGIN/hooks/hooks.json"
 require_json "$ENTRY"
-require_file "$ROOT/docs/submission/claude-community/form-draft.md"
 
 for file in LICENSE PRIVACY.md SUPPORT.md THIRD_PARTY_NOTICES.md; do
   if cmp -s "$ROOT/$file" "$PLUGIN/$file"; then
@@ -92,8 +91,10 @@ contains "$PLUGIN/PRIVACY.md" 'defaults to `off`' 'privacy policy discloses PII 
 contains "$PLUGIN/SECURITY.md" '/security/advisories/new' 'plugin payload provides private security reporting'
 contains "$PLUGIN/SUPPORT.md" 'GitHub Issues' 'plugin payload provides a public support channel'
 contains "$PLUGIN/SUPPORT.md" 'Windows is not currently supported' 'plugin payload discloses platform limits'
+contains "$PLUGIN/SUPPORT.md" '`setsid`' 'plugin support declares the gitleaks isolation dependency'
 contains "$PLUGIN/README.md" 'enabled session' 'plugin README discloses broad hook scope'
 contains "$PLUGIN/README.md" 'never run' 'plugin README discloses lifecycle download behavior'
+contains "$PLUGIN/README.md" '`util-linux`' 'plugin README documents the Linux isolation package'
 
 if jq -e '
   .name == "agent-guard"

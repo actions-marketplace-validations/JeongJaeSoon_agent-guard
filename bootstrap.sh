@@ -45,6 +45,27 @@ resolve_latest_version() {
   printf '%s' "$v"
 }
 
+validate_payload_layout() {
+  # The archive is extracted once into a private staging directory before it
+  # reaches the installation. Do not allow special files or links to be carried
+  # from a release asset into ~/.agent-guard: a link can turn a later update
+  # into a write outside the owned payload directory.
+  if find "$stage" -mindepth 1 ! -type f ! -type d -print | grep -q .; then
+    die "archive contains a symlink or special file"
+  fi
+
+  # A release archive is the plugin payload plus the standalone installer and
+  # deployment examples. Reject unexpected top-level entries rather than
+  # extracting a checksum-valid but malformed asset into an existing install.
+  for entry in "$stage"/.[!.]* "$stage"/..?* "$stage"/*; do
+    [ -e "$entry" ] || continue
+    case ${entry##*/} in
+      .claude-plugin|.codex-plugin|CHANGELOG.md|LICENSE|PRIVACY.md|README.md|SECURITY.md|SUPPORT.md|THIRD_PARTY_NOTICES.md|assets|bin|codex-skills|commands|config|deployment|docs|hooks|hooks.json|install.sh|scripts|skills) ;;
+      *) die "archive contains an unexpected top-level entry: ${entry##*/}" ;;
+    esac
+  done
+}
+
 main() {
   require curl
   require shasum
@@ -74,17 +95,45 @@ main() {
   ( cd "$tmp" && shasum -a 256 -c "$archive.sha256" ) >&2 \
     || die "checksum verification failed for $archive"
 
+  # Validate the downloaded payload before touching a working installation.
+  stage="$tmp/payload"
+  mkdir "$stage"
+  tar -xzf "$tmp/$archive" -C "$stage" || die "archive extraction failed"
+  validate_payload_layout
+  [ -f "$stage/bin/agent-guard" ] && [ ! -L "$stage/bin/agent-guard" ] \
+    && [ -x "$stage/bin/agent-guard" ] || die "expected regular executable not found in archive"
+  [ -f "$stage/install.sh" ] && [ ! -L "$stage/install.sh" ] \
+    && [ -x "$stage/install.sh" ] || die "expected regular installer not found in archive"
+  sh -n "$stage/bin/agent-guard" && sh -n "$stage/install.sh" \
+    || die "archive contains invalid shell scripts"
+  for policy in gitleaks.toml deny-read-paths.txt deny-bash-patterns.txt; do
+    [ -f "$stage/config/$policy" ] && [ ! -L "$stage/config/$policy" ] \
+      && [ -r "$stage/config/$policy" ] || die "archive has no regular policy file: $policy"
+  done
+
   info "$prog: extracting to $HOME_DIR"
-  mkdir -p "$HOME_DIR"
-  tar -xzf "$tmp/$archive" -C "$HOME_DIR"
-
-  bin_path="$HOME_DIR/bin/agent-guard"
-  [ -x "$bin_path" ] || die "expected executable not found after extraction: $bin_path"
-  [ -x "$HOME_DIR/install.sh" ] || die "expected installer not found after extraction: $HOME_DIR/install.sh"
-
+  mkdir -p "$HOME_DIR/bin"
   mkdir -p "$BIN_DIR"
-  ln -sf "$bin_path" "$BIN_DIR/agent-guard"
-  info "$prog: linked $BIN_DIR/agent-guard -> $bin_path"
+  HOME_DIR=$(CDPATH= cd -- "$HOME_DIR" && pwd -P)
+  BIN_DIR=$(CDPATH= cd -- "$BIN_DIR" && pwd -P)
+  # Refuse directory targets rather than copying into them or deleting data.
+  [ ! -d "$HOME_DIR/bin/agent-guard" ] || die "executable destination is a directory"
+  [ ! -L "$HOME_DIR/bin/agent-guard" ] || die "executable destination must not be a symlink"
+  [ ! -d "$BIN_DIR/agent-guard" ] || die "link destination is a directory"
+  # Retain tar's replacement semantics: an existing installer symlink must be
+  # replaced, not followed (or rejected partway through by BSD cp -R).
+  tar -xzf "$tmp/$archive" -C "$HOME_DIR" || die "installation extraction failed"
+  # tar may replace a pre-existing HOME_DIR/bin symlink with the archive's real
+  # bin directory. Resolve it after extraction so a former alias of BIN_DIR does
+  # not make us skip creation of the public executable link.
+  payload_bin_dir=$(CDPATH= cd -- "$HOME_DIR/bin" && pwd -P)
+  bin_path="$HOME_DIR/bin/agent-guard"
+  if [ "$BIN_DIR" = "$payload_bin_dir" ]; then
+    info "$prog: executable already lives in $BIN_DIR; no symlink needed"
+  else
+    ln -sf "$bin_path" "$BIN_DIR/agent-guard"
+    info "$prog: linked $BIN_DIR/agent-guard -> $bin_path"
+  fi
 
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;

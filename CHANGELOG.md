@@ -1,3 +1,65 @@
+## v3.4.4 - 2026-09-17
+
+- fix(release): require reviewed two-phase publishing (#257)
+
+## v3.4.3 - 2026-09-17
+
+- ci: HOL plugin scanner action을 v1.2.678로 업데이트 (#250)
+- fix: untracked 입력 상한의 SIGPIPE 오분류 수정 (#255)
+- docs: 출력 마스킹 범위와 host 가정 명시 (#254)
+- fix: expand Claude post-tool matchers (#253)
+- fix: make gitleaks resolution deterministic (#252)
+- fix: close post-tool masking fail-open paths (#251)
+- fix(verification): Tie the live post-tool probe to an audit run ID and make the verification procedure self-contained (#244)
+
+## v3.4.2 - 2026-09-14
+
+- fix(redaction): keep content-block discriminators and pass image/PDF blocks through the output guard (#239)
+- docs: support Homebrew 6 release checks (#237)
+
+## v3.4.1 - 2026-09-11
+
+- fix: preserve exact documentation placeholders (#235)
+- Separate public and internal rollout documentation (#234)
+- Add safe support log file export (#233)
+- Add CLI-managed Claude and Codex plugin lifecycle (#232)
+
+## v3.4.0 - 2026-09-11
+
+- Prepare safe internal rollout, support logs, and portable installs (#230)
+
+## v3.3.0 - 2026-09-10
+
+- `PostToolUse` now scans the file a write tool just targeted, so a secret written to a gitignored path, outside the repository, into a *different* repository, or into a `skip-worktree` / `assume-unchanged` file is caught. Those were blind spots before: the working-tree backstop skips all of them (#221, #228).
+- `scan-working-tree`, and therefore `/agent-guard:verify`, now covers the index as well as the worktree, both diffed against `HEAD`. Staging a secret and then restoring the file on disk no longer hides it. Content that only differs from the index — a committed secret whose staged removal is undone on disk — is still not reported, because only lines added relative to `HEAD` count (#225).
+- Tier-2 PII detection (credit card, US SSN, Korean resident registration number) now requires digit boundaries and a valid Luhn checksum. Epoch-nanosecond timestamps, snowflake-style ids and other long digit runs are no longer read as card numbers, and IPv4 masking rejects out-of-range octets. `AGENT_GUARD_PII_HOOK_MODE=mask` hard-blocks Tier-2 on tool input, so this is what makes that mode usable (#217).
+- New `AGENT_GUARD_PII_SKIP` turns individual **Tier-1** types (`EMAIL`, `PHONE`, `IP_ADDRESS`) off — useful when IPv4 masking hides what you are debugging. A skipped type stops being PII entirely, so `block` mode also stops blocking it; the switch is not output-only. Tier-2 names and unknown names are refused with exit 2, and it requires the built-in `regex` provider (#219).
+- A Bash path block now names the `deny-read-paths` entry that matched and suggests a non-path-shaped rewrite, instead of only reporting `reason=bash_protected_path_text_match`. The gate still fails closed and no verdict changed; the matched command excerpt is deliberately not echoed, so an authenticated URL in the command cannot reach the transcript through the diagnostic (#220).
+- Documentation now matches the code: `/agent-guard:verify`'s scan scope, why gitignored paths are excluded from it, how to distribute policy environment variables through managed settings and verify the value actually took effect, and what Codex managed configuration does and does not offer (#218, #222).
+
+Existing installations need no new setup step: update the plugin and restart the session. In Codex, re-trust the hooks in **Settings > Hooks** after the update, as with any plugin change. `AGENT_GUARD_PII_HOOK_MODE` remains `off` by default; see the README before enabling it, since Tier-2 hard-blocks tool input and a small residual false-positive class remains.
+
+## v3.2.0 - 2026-09-06
+
+- Add an experimental, explicitly enabled pleno-anonymize PII provider with strict response validation. Remote processing remains off by default.
+- Preserve standalone executable links during updates, including legacy payload directory aliases.
+- Prefer the selected healthy shell cache and reject incomplete or redirected cache payloads. Existing shell integrations should rerun setup-shell after updating.
+- Report unavailable direct scans with exit code 3 while preserving fail-closed execution behavior.
+- Explain ambiguous Bash protected-path matches without weakening protection. Inline source expressions can still match the conservative path gate.
+- Limit the setup skill to explicit invocation and clarify what host dispatch, policy denial, dependency failures, and unobserved execution can establish.
+- Clean up GitHub Action scanner downloads after success, failure, and interruption.
+- Reject malformed or multiple remote PII response objects and avoid echoing endpoint details in provider failures.
+
+Use the README for installation, optional PII configuration, shell integration, and troubleshooting.
+
+## v3.1.1 - 2026-09-04
+
+- feat: harden multi-host installation and release flow
+- fix(detection): exempt the Grep content pattern from the deny-path gate (#188)
+- ci: bump hashgraph-online/ai-plugin-scanner-action (#189)
+- docs: document strict Bash path matching (#185)
+- fix(redaction): mask quoted line-start assignments (#184)
+
 ## v3.1.0 - 2026-08-31
 
 - fix: address post-merge hook regressions (#182)
@@ -379,7 +441,7 @@
 
 - feat!: simplify managed deployment to settings merge plus developer setup (#122)
 
-Breaking changes (see the [2.x to 3.x migration guide](docs/migration-v3.md)):
+Breaking changes (see the [upgrade guidance](README.md#upgrading-older-installations)):
 
 - Removed the `managed-install.sh` entrypoint and the self-contained
   `managed-bootstrap.sh`, including the `managed-bootstrap.sh` /
