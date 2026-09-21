@@ -61,6 +61,8 @@ must be reviewed/trusted again before it runs. See official [Codex Hooks](https:
 | Post-tool probe reports `[REDACTED]` with a `run_id` | A PostToolUse rewrite produced that replacement. Resolve the same `run_id` in `agent-guard logs export` before accepting the report; an id with no record is a failed probe. |
 | A benign command is blocked as a protected path | The shell matcher saw path-shaped text. Use a clearly non-path-shaped expression after reviewing the command. |
 | Post-write scan is unavailable | Treat it as infrastructure failure under the configured policy; do not claim the file was clean. |
+| `exceeded the scan input limit of N bytes` | One pending change (often a regenerated lockfile) is larger than the scan budget. Split it, or set `AGENT_GUARD_SCAN_INPUT_MAX_BYTES` higher; a larger budget scans more, it never skips input. |
+| `git diff failed` followed by `git: <line>` | git itself failed before the scan ran. The second line is git's first stderr line, truncated; act on it (bad revision, corrupt index) rather than on the scanner. |
 
 ## Claude shell integration
 
@@ -112,64 +114,3 @@ funcsave agx
 
 The `current/bin/agent-guard` path is refreshed by plugin execution. If the
 plugin cache is elsewhere, use the executable path printed by setup instead.
-
-## Support evidence
-
-Do not attach transcripts, raw stderr, `.env` files, private keys, or full hook
-payloads. Include only the host, OS/architecture, Agent Guard version, command
-or event category, outcome, and a manually sanitized error summary.
-
-In v3.4.1 and later, `agent-guard logs export --output FILE` writes a
-metadata-only JSONL report to a new private mode-0600 file. It excludes
-content, paths, environment variables, session IDs, and arbitrary tool names.
-The parent directory must already exist; Agent Guard refuses to replace an
-existing file or symlink. [Support](../SUPPORT.md) has the current submission
-checklist.
-
-For a standalone installation, or from a restarted bash/zsh terminal after
-`setup-shell`, run:
-
-```sh
-agent-guard logs status
-agent-guard logs export --output agent-guard-support.jsonl
-```
-
-For a plugin-only installation, replace `agent-guard` with the exact
-plugin-local executable path printed by the setup skill. From fish, before
-restart, or after failed shell setup, rerun the host setup skill and copy that
-complete path; this avoids selecting an unrelated standalone version.
-
-If `logs status` reports logging off, enable the approved rollout setting and
-reproduce with synthetic data. If export reports that `jq` is missing, approve
-the dependency repair proposed by the setup skill and retry. If storage is
-unavailable, export is empty after a reproduced event, or only a start record
-exists, report that state with the version, host, OS/architecture, time and time
-zone, and a manually sanitized error summary. Do not replace the safe export
-with a raw transcript, stderr dump, environment dump, hook payload, or original
-secret-bearing input.
-
-## Staged expansion
-
-This expansion plan applies to the managed Claude Code rollout above. Keep a
-change-ticket table owned by the named rollout owner, with one row for every
-device in the current cohort and no sensitive values. Start with 2–3
-maintainers, then expand to cumulative cohorts of 10, 20, 50, and 100 users.
-Hold each cohort for at least one business day; hold the 100-user cohort for at
-least two business days before declaring the rollout stable.
-
-Use the [rollout acceptance record](../deployment/claude-rollout-acceptance.example.md)
-as the copyable evidence template.
-
-Every device in a cohort must report the approved plugin version and managed
-setting source, successful setup and smoke checks, both live hook probes, a
-normal command with exit 0, and a safe log export. The export must contain the
-corresponding coarse outcomes: `blocked` for the pre-tool probe, `masked` for
-the post-tool probe, and `pass` for the normal command. Match the post-tool
-probe to its record by the `run_id` the replacement names, not by timestamp. Stop expansion on any
-raw synthetic marker, `DEGRADED` result, unexpected block, missing log evidence,
-or version/source drift. Record the rollback owner and previous reviewed tag
-before the first cohort.
-
-Run Codex as a separate pilot. Record per-user hook trust and live-probe results
-instead of a Claude managed-setting source; this document does not claim a
-central Codex managed-settings mechanism.

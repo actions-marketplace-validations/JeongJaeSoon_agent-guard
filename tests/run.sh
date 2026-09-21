@@ -27,6 +27,9 @@ export PATH
 # Keep the large deterministic suite out of the developer's support logs.
 # Dedicated audit tests explicitly turn logging on in private temp storage.
 export AGENT_GUARD_LOG_MODE=off
+# doctor/plugin status look up the latest GitHub release; keep the suite
+# offline and let the release-staleness block opt in with a mock curl.
+export AGENT_GUARD_RELEASE_CHECK=off
 export AGENT_GUARD_GITLEAKS_CONFIG="$PLUGIN_ROOT/config/gitleaks.toml"
 
 # Isolate git from the developer's global config so inherited values like
@@ -4672,6 +4675,129 @@ run_expect 0 "setup --help exits 0" "$PLUGIN_ROOT/bin/agent-guard" setup --help
 run_expect 2 "setup unknown flag exits 2" "$PLUGIN_ROOT/bin/agent-guard" setup --bogus
 run_expect 0 "setup with all deps present exits 0" "$PLUGIN_ROOT/bin/agent-guard" setup
 
+# --- doctor reports release staleness --------------------------------------
+
+RELEASE_BIN="$TMP_ROOT/release-bin"
+mkdir -p "$RELEASE_BIN"
+RELEASE_CURL_LOG="$TMP_ROOT/release-curl.log"
+cat >"$RELEASE_BIN/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$MOCK_RELEASE_LOG"
+printf '%s' "$MOCK_RELEASE_URL"
+exit "${MOCK_RELEASE_STATUS:-0}"
+EOF
+chmod +x "$RELEASE_BIN/curl"
+export MOCK_RELEASE_LOG="$RELEASE_CURL_LOG"
+INSTALLED_VERSION=$("$PLUGIN_ROOT/bin/agent-guard" version | awk 'NR == 1 { print $2 }')
+NEWER_VERSION=$(printf '%s\n' "$INSTALLED_VERSION" | awk -F. '{ printf "%s.%s.%s", $1, $2, $3 + 1 }')
+RELEASE_TAG_URL='https://github.com/JeongJaeSoon/agent-guard/releases/tag/v'
+
+run_release_doctor() {
+  : >"$RELEASE_CURL_LOG"
+  MOCK_RELEASE_URL=$1 MOCK_RELEASE_STATUS=${2:-0} AGENT_GUARD_RELEASE_CHECK=${3:-on} \
+    PATH="$RELEASE_BIN:$PATH" "$PLUGIN_ROOT/bin/agent-guard" doctor >"$OUT" 2>"$ERR"
+}
+
+AGENT_GUARD_RELEASE_CHECK=off "$PLUGIN_ROOT/bin/agent-guard" doctor >"$OUT" 2>"$ERR"
+doctor_baseline_status=$?
+
+run_release_doctor "$RELEASE_TAG_URL$NEWER_VERSION"
+status=$?
+if [ "$status" -eq "$doctor_baseline_status" ] \
+   && grep -Fxq "agent-guard: release: $INSTALLED_VERSION installed; $NEWER_VERSION is available" "$ERR"; then
+  ok "doctor reports a newer release without changing its exit status"
+else
+  not_ok "doctor reports a newer release without changing its exit status (status $status vs $doctor_baseline_status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+run_release_doctor "$RELEASE_TAG_URL$INSTALLED_VERSION"
+if grep -Fxq "agent-guard: release: $INSTALLED_VERSION installed; latest release is $INSTALLED_VERSION" "$ERR" \
+   && grep -q -- '--max-time 5' "$RELEASE_CURL_LOG"; then
+  ok "doctor reports the latest release when it matches the installed version, with a bounded lookup"
+else
+  not_ok "doctor reports the latest release when it matches the installed version, with a bounded lookup"
+  sed 's/^/  stderr: /' "$ERR"
+  sed 's/^/  curl: /' "$RELEASE_CURL_LOG"
+fi
+
+# A dev build ahead of the published release must not be called "latest".
+run_release_doctor "${RELEASE_TAG_URL}0.0.1"
+if grep -Fxq "agent-guard: release: $INSTALLED_VERSION installed; latest release is 0.0.1" "$ERR" \
+   && ! grep -Fq 'is available' "$ERR"; then
+  ok "doctor prints an older published release verbatim instead of claiming latest"
+else
+  not_ok "doctor prints an older published release verbatim instead of claiming latest"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+NO_CURL_BIN="$TMP_ROOT/no-curl-bin"
+mkdir -p "$NO_CURL_BIN"
+# Same PATH minus curl for both runs, so the status comparison isolates the
+# release lookup from whatever else do_setup finds on PATH.
+for tool in sh awk grep sed jq mktemp rm cat dirname pwd printf uname tr head wc ls mkdir chmod cp mv ln readlink date od git; do
+  real=$(command -v "$tool" 2>/dev/null) && ln -sf "$real" "$NO_CURL_BIN/$tool"
+done
+for mock in "$MOCK_BIN"/*; do
+  [ -e "$mock" ] && [ "${mock##*/}" != curl ] && ln -sf "$mock" "$NO_CURL_BIN/${mock##*/}"
+done
+AGENT_GUARD_RELEASE_CHECK=off PATH="$NO_CURL_BIN" "$PLUGIN_ROOT/bin/agent-guard" doctor >"$OUT" 2>"$ERR"
+no_curl_baseline_status=$?
+AGENT_GUARD_RELEASE_CHECK=on PATH="$NO_CURL_BIN" "$PLUGIN_ROOT/bin/agent-guard" doctor >"$OUT" 2>"$ERR"
+status=$?
+if ! PATH="$NO_CURL_BIN" command -v curl >/dev/null 2>&1 \
+   && [ "$status" -eq "$no_curl_baseline_status" ] \
+   && grep -Fq "installed; latest unknown" "$ERR"; then
+  ok "doctor reports latest unknown when curl is absent from PATH"
+else
+  not_ok "doctor reports latest unknown when curl is absent from PATH (status $status vs $no_curl_baseline_status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+run_release_doctor '' 1
+status=$?
+if [ "$status" -eq "$doctor_baseline_status" ] \
+   && grep -Fxq "agent-guard: release: $INSTALLED_VERSION installed; latest unknown (release lookup unavailable or AGENT_GUARD_RELEASE_CHECK=off)" "$ERR"; then
+  ok "doctor reports latest unknown when the release lookup fails"
+else
+  not_ok "doctor reports latest unknown when the release lookup fails (status $status vs $doctor_baseline_status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+for bad_url in 'https://evil.example/releases/tag/v9.9.9' \
+               "${RELEASE_TAG_URL}1.2.3.4" \
+               "${RELEASE_TAG_URL}9.9.9/../../evil" \
+               "${RELEASE_TAG_URL}9.9.9/extra" \
+               "${RELEASE_TAG_URL}9.9.9 " \
+               'https://github.com/JeongJaeSoon/agent-guard/releases/tag/9.9.9'; do
+  run_release_doctor "$bad_url"
+  if grep -Fq 'installed; latest unknown' "$ERR" \
+     && ! grep -Fq "$bad_url" "$ERR" && ! grep -Fq 'is available' "$ERR"; then
+    ok "doctor rejects unexpected redirect target and never echoes it"
+  else
+    not_ok "doctor rejects unexpected redirect target and never echoes it ($bad_url)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+
+run_release_doctor "$RELEASE_TAG_URL$NEWER_VERSION" 0 off
+if [ ! -s "$RELEASE_CURL_LOG" ] \
+   && grep -Fq 'installed; latest unknown' "$ERR"; then
+  ok "AGENT_GUARD_RELEASE_CHECK=off skips the release lookup entirely"
+else
+  not_ok "AGENT_GUARD_RELEASE_CHECK=off skips the release lookup entirely"
+  sed 's/^/  curl: /' "$RELEASE_CURL_LOG"
+fi
+
+run_release_doctor "$RELEASE_TAG_URL$NEWER_VERSION"
+if grep -q -- '-fsSI' "$RELEASE_CURL_LOG" && grep -q 'releases/latest' "$RELEASE_CURL_LOG" \
+   && [ "$(wc -l <"$RELEASE_CURL_LOG" | tr -d ' ')" -eq 1 ]; then
+  ok "doctor performs exactly one HEAD lookup against releases/latest"
+else
+  not_ok "doctor performs exactly one HEAD lookup against releases/latest"
+  sed 's/^/  curl: /' "$RELEASE_CURL_LOG"
+fi
+
 # --- scan-path -------------------------------------------------------------
 
 CLEAN_DIR="$TMP_ROOT/clean-dir"
@@ -6742,6 +6868,21 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+# The env override is the escape hatch for the closed policy above: raising
+# the budget scans the same input in full instead of skipping it.
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  AGENT_GUARD_SCAN_INPUT_MAX_BYTES=33554432 \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] && ! grep -Fq 'scan input limit' "$ERR"; then
+  ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES lifts the untracked scan input limit"
+else
+  not_ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES lifts the untracked limit (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
 # --- git diff scan input limit keeps truncation distinct from failures -----
 # The diff producer is bounded by the same sentinel-byte `head`, so git reports
 # SIGPIPE once the budget is reached. The byte count, not that expected producer
@@ -6806,6 +6947,135 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+# git's own stderr is the only detail that separates `fatal: bad revision`
+# from a missing binary, so the failure path relays its first line — bounded,
+# control characters stripped — and nothing else.
+DIFF_NOISY_BIN="$TESTTMP/diff-noisy-bin"
+mkdir -p "$DIFF_NOISY_BIN"
+DIFF_NOISY_LINE_1=$(awk 'BEGIN { printf "fatal: \r\tbad "; for (i = 0; i < 260; i++) printf "e" }')
+cat >"$DIFF_NOISY_BIN/git" <<EOSH
+#!/usr/bin/env sh
+if [ "\${1:-}" = diff ]; then
+  printf '%s\\n' "$DIFF_NOISY_LINE_1" >&2
+  printf 'second-line-must-not-leak\\n' >&2
+  exit 42
+fi
+exec "\$AGENT_GUARD_TEST_REAL_GIT" "\$@"
+EOSH
+chmod +x "$DIFF_NOISY_BIN/git"
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  PATH="$DIFF_NOISY_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+git_line=$(grep -F 'agent-guard: git: ' "$ERR")
+git_line_bytes=$(printf '%s' "$git_line" | LC_ALL=C wc -c | tr -d '[:space:]')
+expected_git_line="agent-guard: git: $(printf '%s' "$DIFF_NOISY_LINE_1" | head -c 200 | tr -d '[:cntrl:]')"
+if [ "$status" -eq 3 ] \
+   && grep -Fq 'git diff failed' "$ERR" \
+   && [ "$git_line" = "$expected_git_line" ] \
+   && [ "$git_line_bytes" -le 218 ] \
+   && ! grep -Fq 'second-line-must-not-leak' "$ERR" \
+   && ! grep -q "$(printf '\r')" "$ERR"; then
+  ok "genuine git diff failure relays one bounded, sanitized git stderr line"
+else
+  not_ok "git diff stderr is bounded to one 200-byte line (expected 3, got $status; line bytes $git_line_bytes)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  PATH="$DIFF_FAIL_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+if ! grep -Fq 'agent-guard: git: ' "$ERR"; then
+  ok "silent git diff failure emits no empty git stderr line"
+else
+  not_ok "silent git diff failure emits no empty git stderr line"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] && ! grep -Fq 'agent-guard: git: ' "$ERR"; then
+  ok "clean scan-staged emits no git stderr line"
+else
+  not_ok "clean scan-staged emits no git stderr line (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# The stderr capture is bounded at the source: a git wrapper that floods stderr
+# (~2 MiB here) must not fill TMPDIR or burn the hook timeout before the
+# failure path truncates. The side file proves the flood was really produced;
+# the marker file proves git's stderr was a bounded reader, not a plain file
+# (an unbounded `2>file` capture is what the guard's read-side truncation hid).
+DIFF_FLOOD_BIN="$TESTTMP/diff-flood-bin"
+DIFF_FLOOD_SIDE="$TESTTMP/diff-flood-side.txt"
+DIFF_FLOOD_UNBOUNDED="$TESTTMP/diff-flood-unbounded.marker"
+mkdir -p "$DIFF_FLOOD_BIN"
+cat >"$DIFF_FLOOD_BIN/git" <<EOSH
+#!/usr/bin/env sh
+if [ "\${1:-}" = diff ]; then
+  [ -f /dev/fd/2 ] && : >"$DIFF_FLOOD_UNBOUNDED"
+  awk 'BEGIN { for (i = 0; i < 100000; i++) print "noise-line-payload-" i }' | tee "$DIFF_FLOOD_SIDE" >&2
+  exit 42
+fi
+exec "\$AGENT_GUARD_TEST_REAL_GIT" "\$@"
+EOSH
+chmod +x "$DIFF_FLOOD_BIN/git"
+rm -f "$DIFF_FLOOD_SIDE" "$DIFF_FLOOD_UNBOUNDED"
+flood_start=$(date +%s)
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  PATH="$DIFF_FLOOD_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+flood_seconds=$(( $(date +%s) - flood_start ))
+flood_side_bytes=$(LC_ALL=C wc -c <"$DIFF_FLOOD_SIDE" 2>/dev/null | tr -d '[:space:]')
+git_line_count=$(grep -c 'agent-guard: git: ' "$ERR")
+if [ "$status" -eq 3 ] \
+   && grep -Fq 'git diff failed' "$ERR" \
+   && [ "$git_line_count" -eq 1 ] \
+   && grep -Fq 'agent-guard: git: noise-line-payload-0' "$ERR" \
+   && [ "${flood_side_bytes:-0}" -gt 2000000 ] \
+   && [ ! -e "$DIFF_FLOOD_UNBOUNDED" ] \
+   && [ "$flood_seconds" -lt 20 ]; then
+  ok "flooded git diff stderr is bounded at capture and still relays one line"
+else
+  not_ok "flooded git diff stderr is bounded at capture (expected 3, got $status; git lines $git_line_count; side bytes ${flood_side_bytes:-0}; unbounded marker $([ -e "$DIFF_FLOOD_UNBOUNDED" ] && echo present || echo absent); ${flood_seconds}s)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Must-pass control: the bounded reader drains rather than closes git's stderr,
+# so a git that warns past the capture cap and then succeeds is not killed by
+# SIGPIPE and its clean diff still yields a clean scan.
+DIFF_WARN_BIN="$TESTTMP/diff-warn-bin"
+mkdir -p "$DIFF_WARN_BIN"
+cat >"$DIFF_WARN_BIN/git" <<'EOSH'
+#!/usr/bin/env sh
+if [ "${1:-}" = diff ]; then
+  awk 'BEGIN { for (i = 0; i < 2000; i++) print "warning: noisy-but-successful-line " i }' >&2
+  exit 0
+fi
+exec "$AGENT_GUARD_TEST_REAL_GIT" "$@"
+EOSH
+chmod +x "$DIFF_WARN_BIN/git"
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  PATH="$DIFF_WARN_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] && ! grep -Fq 'agent-guard: git: ' "$ERR"; then
+  ok "noisy-but-successful git diff is not killed by SIGPIPE on stderr"
+else
+  not_ok "noisy-but-successful git diff scans clean (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
 # Hook policy still decides what an unavailable scan means; the corrected
 # classification must not change the established open/closed behavior.
 (
@@ -6838,6 +7108,111 @@ if [ "$status" -eq 2 ] \
   ok "over-limit diff preserves closed hook policy"
 else
   not_ok "over-limit diff follows closed hook policy (expected 2, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+# --- AGENT_GUARD_SCAN_INPUT_MAX_BYTES raises the budget, never lowers it ---
+# The diagnostic names the override so a closed-policy block is actionable;
+# invalid values keep the default rather than silently changing the budget.
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+if grep -Fq 'or raise AGENT_GUARD_SCAN_INPUT_MAX_BYTES' "$ERR"; then
+  ok "over-limit diff diagnostic names AGENT_GUARD_SCAN_INPUT_MAX_BYTES"
+else
+  not_ok "over-limit diff diagnostic names AGENT_GUARD_SCAN_INPUT_MAX_BYTES"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  AGENT_GUARD_SCAN_INPUT_MAX_BYTES=33554432 \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] && ! grep -Fq 'scan input limit' "$ERR"; then
+  ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES lifts the staged diff scan input limit"
+else
+  not_ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES lifts the staged diff limit (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+# Raise-only: a value below the default would shrink the budget until every
+# diff is unavailable and the open policy waves unscanned input through. A
+# 19+ digit value would abort dash arithmetic, so it is rejected before use.
+for bad_limit in abc 0 000 -1 '' 1 10485759 9223372036854775808 1000000000000000000000; do
+  (
+    cd "$DIFF_LIMIT_REPO" || exit 2
+    AGENT_GUARD_SCAN_INPUT_MAX_BYTES="$bad_limit" \
+      "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+  )
+  status=$?
+  if [ "$status" -eq 3 ] \
+     && grep -Fq 'git diff exceeded the scan input limit of 3495253 bytes' "$ERR"; then
+    ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES='$bad_limit' keeps the default budget"
+  else
+    not_ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES='$bad_limit' keeps the default budget (expected 3, got $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+done
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  AGENT_GUARD_SCAN_INPUT_MAX_BYTES=0033554432 \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] && ! grep -Fq 'scan input limit' "$ERR"; then
+  ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES accepts a leading-zero positive value"
+else
+  not_ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES accepts a leading-zero positive value (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+# Exactly the default is accepted (the boundary of raise-only) and leaves the
+# budget unchanged, so the 3.6 MB fixture is still over the per-producer third.
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  AGENT_GUARD_SCAN_INPUT_MAX_BYTES=10485760 \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 3 ] \
+   && grep -Fq 'git diff exceeded the scan input limit of 3495253 bytes' "$ERR"; then
+  ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES equal to the default keeps the default budget"
+else
+  not_ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES equal to the default keeps the default budget (expected 3, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+# A below-default value must not turn a small clean diff into "unavailable",
+# which is the open-policy bypass the raise-only rule exists to prevent.
+(
+  cd "$UNTRACKED_LIMIT_REPO" || exit 2
+  printf 'small clean staged edit\n' >>README.md
+  git add README.md
+  AGENT_GUARD_SCAN_INPUT_MAX_BYTES=1 \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
+  status=$?
+  git reset -q --hard
+  exit "$status"
+)
+status=$?
+if [ "$status" -eq 0 ] && ! grep -Fq 'scan input limit' "$ERR"; then
+  ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES=1 cannot shrink the budget below a small clean diff"
+else
+  not_ok "AGENT_GUARD_SCAN_INPUT_MAX_BYTES=1 cannot shrink the budget (expected 0, got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+(
+  cd "$DIFF_LIMIT_REPO" || exit 2
+  printf '%s' '{"session_id":"diff-limit-closed-raised","stop_hook_active":false}' \
+    | AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+        AGENT_GUARD_SCAN_INPUT_MAX_BYTES=33554432 \
+        AGENT_GUARD_WARNING_DIR="$TESTTMP/diff-limit-closed-raised-warn" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-stop >"$OUT" 2>"$ERR"
+)
+status=$?
+if [ "$status" -eq 0 ] && ! grep -Fq 'scan input limit' "$ERR"; then
+  ok "raised budget unblocks the closed-policy stop hook end to end"
+else
+  not_ok "raised budget unblocks the closed-policy stop hook (expected 0, got $status)"
   sed 's/^/  stderr: /' "$ERR"
 fi
 
