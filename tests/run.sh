@@ -38,6 +38,12 @@ export AGENT_GUARD_GITLEAKS_CONFIG="$PLUGIN_ROOT/config/gitleaks.toml"
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_SYSTEM=/dev/null
 
+# Claude Code exports AI_AGENT to every subprocess, and its version decides
+# whether a blocking hook adds a JSON reason. Run the suite as an unknown host
+# version so results do not depend on where it runs; the block-reason tests
+# set it explicitly.
+unset AI_AGENT
+
 pass=0
 fail=0
 
@@ -90,6 +96,13 @@ expect_json_status() {
   fi
 }
 
+prompt_guard_case() { # $1 host, $2 prompt mode ('' = default), $3 pii mode ('' = off), $4 json
+  printf '%s' "$4" \
+    | AGENT_GUARD_HOOK_HOST="$1" AGENT_GUARD_PROMPT_GUARD_MODE="$2" \
+      AGENT_GUARD_PII_HOOK_MODE="$3" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-user-prompt
+}
+
 cleanup() {
   rm -rf "$TMP_ROOT" "$TESTTMP"
 }
@@ -102,6 +115,58 @@ mkdir -p "$MOCK_BIN"
 DEFAULT_PRIVATE_GITLEAKS_DIR="$TMP_ROOT/private-gitleaks-empty"
 mkdir -p "$DEFAULT_PRIVATE_GITLEAKS_DIR"
 export AGENT_GUARD_GITLEAKS_BIN_DIR="$DEFAULT_PRIVATE_GITLEAKS_DIR"
+cp "$ROOT/tests/fixtures/mock-gitleaks" "$MOCK_BIN/gitleaks"
+chmod +x "$MOCK_BIN/gitleaks"
+
+# CI runs the suite as parallel jobs, one per AGENT_GUARD_TEST_SHARD value;
+# unset runs every shard in order. A shard skips the other shards' blocks, so it
+# must build its own fixtures rather than reuse one an earlier shard created.
+case ${AGENT_GUARD_TEST_SHARD:-} in
+  ''|1|2|3|4|5) ;;
+  *)
+    say "AGENT_GUARD_TEST_SHARD must be unset or 1-5, got: $AGENT_GUARD_TEST_SHARD" >&2
+    exit 2
+    ;;
+esac
+case ${AGENT_GUARD_TEST_NAVIGATION_HOST:-} in
+  '') ;;
+  claude|codex)
+    if [ "${AGENT_GUARD_TEST_SHARD:-}" != 5 ]; then
+      say "AGENT_GUARD_TEST_NAVIGATION_HOST requires AGENT_GUARD_TEST_SHARD=5" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    say "AGENT_GUARD_TEST_NAVIGATION_HOST must be unset, claude, or codex, got: $AGENT_GUARD_TEST_NAVIGATION_HOST" >&2
+    exit 2
+    ;;
+esac
+
+in_shard() {
+  [ -z "${AGENT_GUARD_TEST_SHARD:-}" ] || [ "$AGENT_GUARD_TEST_SHARD" = "$1" ]
+}
+
+in_navigation_host() {
+  [ -z "${AGENT_GUARD_TEST_NAVIGATION_HOST:-}" ] \
+    || [ "$AGENT_GUARD_TEST_NAVIGATION_HOST" = "$1" ]
+}
+
+if in_shard 1; then
+run_expect 0 "core function contracts" sh "$ROOT/tests/unit-core.sh"
+run_expect 0 "framing producer contracts" sh "$ROOT/tests/unit-framing.sh"
+run_expect 0 "deny-path character producer contracts" sh "$ROOT/tests/unit-deny-path.sh"
+run_expect 0 "probe eligibility contracts" sh "$ROOT/tests/unit-probe.sh"
+run_expect 0 "status-label classification contracts" sh "$ROOT/tests/unit-status-label.sh"
+suite_shards=$(sed -n 's/^if in_shard \([0-9]*\); then$/\1/p' "$ROOT/tests/run.sh" | sort -u | tr '\n' ' ')
+ci_shards=$(sed -n "s/^ *shards: '\([0-9 ][0-9 ]*\)'$/\1/p" "$ROOT/.github/workflows/ci.yml" | tr ' ' '\n' | sort | tr '\n' ' ')
+ci_navigation_hosts=$(awk '$1 == "navigation_host:" { print $2 }' "$ROOT/.github/workflows/ci.yml" | sort | tr '\n' ' ')
+if [ -n "$suite_shards" ] && [ "$suite_shards" = '1 2 3 4 5 ' ] \
+  && [ "$ci_shards" = '1 2 3 4 5 5 ' ] \
+  && [ "$ci_navigation_hosts" = 'claude codex ' ]; then
+  ok "every test shard and navigation host runs in the CI matrix"
+else
+  not_ok "every test shard and navigation host runs in the CI matrix (suite: $suite_shards; ci.yml: $ci_shards; navigation hosts: $ci_navigation_hosts)"
+fi
 
 if [ ! -e "$PLUGIN_ROOT/commands/setup-shell.md" ]; then
   ok "setup-shell has a single skill implementation"
@@ -126,18 +191,22 @@ if grep -Fq '../../bin/agent-guard' "$setup_shell_skill" \
 else
   not_ok "setup-shell skill stays host-neutral with approval and fallback guidance"
 fi
-cp "$ROOT/tests/fixtures/mock-gitleaks" "$MOCK_BIN/gitleaks"
-chmod +x "$MOCK_BIN/gitleaks"
 
 for file in \
   "$PLUGIN_ROOT/bin/agent-guard" \
   "$ROOT/install.sh" \
   "$ROOT/bootstrap.sh" \
   "$ROOT/scripts/build-release-tarball.sh" \
+  "$ROOT/scripts/publish-homebrew-tap.sh" \
+  "$ROOT/tests/homebrew-tap.sh" \
   "$ROOT/githooks/pre-commit" \
   "$PLUGIN_ROOT/scripts/gitleaks-checksum.sh" \
   "$ROOT/tests/hook-outcome-contract.sh" \
+  "$ROOT/tests/deny-read-mask.sh" \
+  "$ROOT/tests/deny-read-mask-rules.sh" \
+  "$ROOT/tests/deny-read-mask-allow.sh" \
   "$ROOT/tests/gitleaks-resolution.sh" \
+  "$ROOT/tests/gitleaks-probe-cache.sh" \
   "$ROOT/tests/run.sh"; do
   run_expect 0 "shell syntax: $file" sh -n "$file"
 done
@@ -159,10 +228,6 @@ else
   not_ok "managed Claude settings do not claim unsupported marketplace SHA pinning"
 fi
 
-# The direct installer must leave command wrapping active on a fresh install,
-# while AGENT_GUARD_COMMAND_WRAPPING=off is a persistent install-time opt-out.
-# Stub only the release downloads; archive verification, extraction, linking,
-# setup-shell, and rc generation all run through the real implementation.
 run_expect 0 "private metadata-only audit logging contract" sh "$ROOT/tests/audit-log.sh"
 run_expect 0 "host plugin lifecycle delegates safely" sh "$ROOT/tests/plugin-management.sh"
 
@@ -170,6 +235,12 @@ run_expect 0 "standalone update preserves executable and link destinations" \
   sh "$ROOT/tests/bootstrap-update.sh"
 run_expect 0 "release archive carries README-linked Markdown guides" \
   sh "$ROOT/tests/release-docs.sh"
+run_expect 0 "release opens a Homebrew tap PR without touching tap main" \
+  sh "$ROOT/tests/homebrew-tap.sh"
+# The direct installer must leave command wrapping active on a fresh install,
+# while AGENT_GUARD_COMMAND_WRAPPING=off is a persistent install-time opt-out.
+# Stub only the release downloads; archive verification, extraction, linking,
+# setup-shell, and rc generation all run through the real implementation.
 bootstrap_fixture="$TESTTMP/bootstrap-fixture"
 mkdir -p "$bootstrap_fixture/bin"
 "$ROOT/scripts/build-release-tarball.sh" 2.0.0 "$bootstrap_fixture/agent-guard-2.0.0.tar.gz"
@@ -197,16 +268,11 @@ chmod +x "$bootstrap_fixture/bin/curl"
 for bootstrap_mode in on off; do
   bootstrap_home="$TESTTMP/bootstrap-$bootstrap_mode"
   mkdir -p "$bootstrap_home"
-  if [ "$bootstrap_mode" = off ]; then
-    bootstrap_toggle=off
-  else
-    bootstrap_toggle=on
-  fi
   BOOTSTRAP_FIXTURE="$bootstrap_fixture" \
   AGENT_GUARD_VERSION=2.0.0 \
   AGENT_GUARD_HOME="$bootstrap_home/agent-guard" \
   AGENT_GUARD_BIN_DIR="$bootstrap_home/bin" \
-  AGENT_GUARD_COMMAND_WRAPPING="$bootstrap_toggle" \
+  AGENT_GUARD_COMMAND_WRAPPING="$bootstrap_mode" \
   HOME="$bootstrap_home" SHELL=/bin/zsh \
   PATH="$bootstrap_fixture/bin:/usr/bin:/bin" \
     sh "$ROOT/bootstrap.sh" >"$OUT" 2>"$ERR"
@@ -550,7 +616,7 @@ hook_subcommand() {
 
 for event in PreToolUse PostToolUse Stop UserPromptSubmit; do
   case "$event" in
-    PreToolUse)  expected_sub=hook-pre-tool;  expected_timeout=10 ;;
+    PreToolUse)  expected_sub=hook-pre-tool;  expected_timeout=60 ;;
     PostToolUse) expected_sub=hook-post-tool; expected_timeout=20 ;;
     Stop)        expected_sub=hook-stop;      expected_timeout=20 ;;
     UserPromptSubmit) expected_sub=hook-user-prompt; expected_timeout=10 ;;
@@ -594,6 +660,30 @@ for event in PreToolUse PostToolUse Stop UserPromptSubmit; do
     ok "$event command subcommand in $file matches hooks/hooks.json"
   else
     not_ok "$event command subcommand in $file matches hooks/hooks.json (got: $actual_sub)"
+  fi
+done
+
+# Claude runs the tool when a PreToolUse hook times out or crashes unless the
+# hook sets onFailure "block". Only PreToolUse needs it, and Codex has no such
+# key, so every other hook object must leave it unset.
+for file in "$PLUGIN_ROOT/hooks/hooks.json" "$ROOT/examples/claude/settings.project.json" \
+  "$PLUGIN_ROOT/hooks.json" "$ROOT/examples/codex/hooks.json"; do
+  case "$file" in
+    "$PLUGIN_ROOT/hooks/hooks.json"|*/examples/claude/*) expected_pre=block ;;
+    *) expected_pre=null ;;
+  esac
+  actual_pre=$(jq -r '.hooks.PreToolUse[0].hooks[0].onFailure' "$file")
+  if [ "$actual_pre" = "$expected_pre" ]; then
+    ok "PreToolUse onFailure is $expected_pre in $file"
+  else
+    not_ok "PreToolUse onFailure is $expected_pre in $file (got: $actual_pre)"
+  fi
+  others=$(jq -r '[.hooks | to_entries[] | select(.key != "PreToolUse")
+                   | .value[].hooks[] | select(has("onFailure"))] | length' "$file")
+  if [ "$others" = 0 ]; then
+    ok "no non-PreToolUse hook sets onFailure in $file"
+  else
+    not_ok "no non-PreToolUse hook sets onFailure in $file (got: $others)"
   fi
 done
 
@@ -700,8 +790,8 @@ for event in PreToolUse PostToolUse Stop SessionStart UserPromptSubmit; do
   fi
 done
 
-# Both manifests are rendered artifacts: scripts/render-hook-manifests.sh owns
-# the single resolver template and the per-host tables. A hand edit that skips
+# All four manifests (two plugin, two example) are rendered artifacts:
+# scripts/render-hook-manifests.sh owns the single resolver template and the per-host tables. A hand edit that skips
 # the renderer would reintroduce the copy-drift class the normalization checks
 # above can only partially catch.
 if sh "$ROOT/scripts/render-hook-manifests.sh" --check >/dev/null 2>&1; then
@@ -1061,6 +1151,44 @@ for manifest_host in codex claude; do
     not_ok "$manifest_host manifest missing-binary warning reports closed mode (status $status)"
     sed 's/^/  stderr: /' "$ERR"
   fi
+
+  # The once-per-session marker is for the open warning only: every closed
+  # block must say why, or the host shows a denial with empty stderr.
+  manifest_command=$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$manifest_file")
+  for attempt in first second; do
+    printf '%s' '{"session_id":"manifest-closed-repeat"}' \
+      | env "$manifest_root=$TESTTMP/missing-plugin/0.0.0" \
+          AGENT_GUARD_WARNING_DIR="$TESTTMP/manifest-closed-repeat-$manifest_host" \
+          AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+          sh -c "$manifest_command" >"$OUT" 2>"$ERR"
+    status=$?
+    if [ "$status" -eq 2 ] && grep -q 'blocking because AGENT_GUARD_INFRA_FAILURE_MODE=closed' "$ERR"; then
+      ok "$manifest_host manifest explains the $attempt closed missing-binary block in a session"
+    else
+      not_ok "$manifest_host manifest explains the $attempt closed missing-binary block in a session (status $status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+
+  # A marker that cannot be written (full disk, read-only dir) is not proof
+  # this session already warned.
+  if [ "$(id -u)" -ne 0 ]; then
+    manifest_ro_dir="$TESTTMP/manifest-readonly-$manifest_host"
+    mkdir -p "$manifest_ro_dir"
+    chmod 0500 "$manifest_ro_dir"
+    printf '%s' '{"session_id":"manifest-readonly"}' \
+      | env "$manifest_root=$TESTTMP/missing-plugin/0.0.0" \
+          AGENT_GUARD_WARNING_DIR="$manifest_ro_dir" \
+          sh -c "$manifest_command" >"$OUT" 2>"$ERR"
+    status=$?
+    chmod 0700 "$manifest_ro_dir"
+    if [ "$status" -eq 0 ] && grep -q 'continuing because AGENT_GUARD_INFRA_FAILURE_MODE=open' "$ERR"; then
+      ok "$manifest_host manifest warns when the warning marker cannot be written"
+    else
+      not_ok "$manifest_host manifest warns when the warning marker cannot be written (status $status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  fi
 done
 
 # Pinned gitleaks default version is duplicated across three surfaces (the
@@ -1081,10 +1209,13 @@ action_ver=$(awk '
     exit
   }
 ' "$ROOT/action.yml")
-if [ -n "$bin_ver" ] && [ "$bin_ver" = "$script_ver" ] && [ "$bin_ver" = "$action_ver" ]; then
-  ok "gitleaks default version in sync across bin/agent-guard, gitleaks-checksum.sh, and action.yml ($bin_ver)"
+ci_ver=$(awk '/^  GITLEAKS_VERSION:/ { gsub(/"/, "", $2); print $2; exit }' "$ROOT/.github/workflows/ci.yml")
+release_ver=$(awk '/^  GITLEAKS_VERSION:/ { gsub(/"/, "", $2); print $2; exit }' "$ROOT/.github/workflows/release.yml")
+if [ -n "$bin_ver" ] && [ "$bin_ver" = "$script_ver" ] && [ "$bin_ver" = "$action_ver" ] \
+  && [ "$bin_ver" = "$ci_ver" ] && [ "$bin_ver" = "$release_ver" ]; then
+  ok "gitleaks default version in sync across bin/agent-guard, gitleaks-checksum.sh, action.yml, and the CI and release workflows ($bin_ver)"
 else
-  not_ok "gitleaks default version drift: bin=$bin_ver script=$script_ver action=$action_ver"
+  not_ok "gitleaks default version drift: bin=$bin_ver script=$script_ver action=$action_ver ci=$ci_ver release=$release_ver"
 fi
 
 # Release version is consumed independently by both plugin hosts and the Claude
@@ -1297,6 +1428,43 @@ expect_json_status 2 "Bash ANSI-C quoted path bypass is blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"cat $'\''.e\\x6ev'\''"}}' \
   hook-pre-tool
 
+# Bash decodes $'...' before the word reaches the command, including when the
+# escape is spliced with unquoted text or followed by a glob.
+expect_json_status 2 "Bash ANSI-C hex escape spliced with unquoted text is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat $'\''.e\\x6e'\''v"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash ANSI-C octal escape is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat $'\''.e\\156v'\''"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash unquoted prefix before an ANSI-C escape is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat .e$'\''\\x6e'\''v"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash ANSI-C escape followed by a spanning star is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/$'\''.\\x6e'\''*"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash ANSI-C escapes that name no protected path remain allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"printf $'\''a\\tb\\n'\'' && grep $'\''\\t'\'' notes.txt"}}' \
+  hook-pre-tool
+
+# Bash drops an unquoted line continuation before it reads quotes, so `$`, a
+# continuation, and a quote still open a $'...' string.
+expect_json_status 2 "Bash line continuation inside an ANSI-C quote opener is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat $\\\n'\''.e\\156'\''v"}}' \
+  hook-pre-tool
+
+# Only a real $'...' string decodes escapes; the same text elsewhere is literal.
+expect_json_status 0 "Bash escaped dollar before a quoted hex escape remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat \\$'\''.e\\x6e'\''v"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash single-quoted hex escape text spliced with unquoted text remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat '\''.e\\x6e'\''v"}}' \
+  hook-pre-tool
+
 expect_json_status 2 "Bash glob bracket path bypass is blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"cat .e[n]v"}}' \
   hook-pre-tool
@@ -1305,8 +1473,139 @@ expect_json_status 2 "Bash glob wildcard path bypass is blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"cat .e?v"}}' \
   hook-pre-tool
 
+# One `*` can expand over several characters of a deny entry, so a star after
+# any pinned prefix still names the protected file.
+expect_json_status 2 "Bash trailing star over a protected dotfile is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat .e*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash trailing star after a longer home-dotfile prefix is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.net*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash trailing star after a one-letter home-dotfile prefix is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.n*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash mid-word star spanning several characters is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.n*c"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash word with several spanning stars is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.n*t*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash star after a single-position glob prefix is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.?e*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash star over a protected directory's files is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.aws/*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash star over a protected directory component is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.config/*/hosts.yml"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash star inside the first of several protected components is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.c*/gh/hosts.yml"}}' \
+  hook-pre-tool
+
+# A dot-led word can also pin the entry's last letter after the star.
+expect_json_status 2 "Bash leading star before a protected dotfile's last letter is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat .*v"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash leading star before a protected dotfile's last letters is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.*rc"}}' \
+  hook-pre-tool
+
 expect_json_status 0 "Bash benign glob remains allowed" \
   '{"tool_name":"Bash","tool_input":{"command":"ls *.md"}}' \
+  hook-pre-tool
+
+# The spanning-star prefix must pin the entry's first name character, so a star
+# in an ordinary regex or a bare wildcard does not read as a protected path.
+expect_json_status 0 "Bash bare wildcard remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"ls *"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash any-character regex remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"sed '\''s/.*//'\'' notes.txt"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash whitespace-class regex remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"sed -E '\''s/\\s*$//'\'' notes.txt"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash star after an unrelated dot-directory prefix remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"ls .github/*"}}' \
+  hook-pre-tool
+
+# A shell star never matches `/`, so it cannot reach a file inside the
+# protected directory it names.
+expect_json_status 0 "Bash star after a protected directory prefix remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"ls -d ~/.config*"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash star after a protected directory name remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"ls -d ~/.aws*"}}' \
+  hook-pre-tool
+
+# Pinning a suffix needs a leading dot; without it a star names ordinary files.
+expect_json_status 0 "Bash extension glob shared with a protected file name remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"ls *.json"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash any-character regex before a word remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"sed -n '\''s/.*version: //p'\'' notes.txt"}}' \
+  hook-pre-tool
+
+# A `[` opens a bracket expression that matches one character, so the word
+# after it does not start a file name: a CSS attribute substring selector is
+# not a star over an SSH key entry, quoted or not.
+expect_json_status 0 "Bash single-quoted CSS attribute substring selector remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool query --selector '\''div[id*=\"amount\"] >> nth=0'\''"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash double-quoted CSS attribute substring selector remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool query --selector \"div[id*='\''amount'\'']\""}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash piped CSS attribute substring selector remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool query --selector '\''td[id*=\"x\"]'\'' 2>&1 | tail -1"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash chained CSS attribute substring selectors remain allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool query --selector '\''div[id*=\"a\"][id*=\"b\"]'\''"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash unquoted CSS attribute substring selector remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool query --selector div[id*=x]"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash CSS attribute prefix selector remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool query --selector '\''div[id^=\"x\"]'\''"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash CSS class substring selector remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool query --selector '\''div[class*=\"x\"]'\''"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash star after an SSH key prefix is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat id*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash star after an SSH key prefix in the SSH directory is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.ssh/id*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash bracket glob that pins an SSH key prefix is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.ssh/[i]d*"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash bracket glob inside an SSH key prefix is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat ~/.ssh/i[d]*"}}' \
   hook-pre-tool
 
 expect_json_status 0 "ripgrep negative glob over a denied extension is allowed" \
@@ -1320,6 +1619,43 @@ expect_json_status 0 "command-wrapped ripgrep negative glob is allowed" \
 expect_json_status 2 "ripgrep positive glob over a denied extension remains blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"rg --files -g '\''*.pem'\''"}}' \
   hook-pre-tool
+
+# A star that stands for one entry character must come with a pinned letter.
+# Each case runs through both hosts' native event shapes.
+star_stand_in_fixtures="$ROOT/tests/fixtures/bash-star-stand-in.json"
+star_stand_in_cases="$TESTTMP/bash-star-stand-in.cases"
+star_stand_in_dir="$TESTTMP/bash-star-stand-in"
+mkdir -p "$star_stand_in_dir"
+if jq -e 'type == "array" and length > 0' "$star_stand_in_fixtures" >/dev/null \
+  && jq -c '.[]' "$star_stand_in_fixtures" >"$star_stand_in_cases"; then
+  ok "star stand-in fixture corpus is valid and non-empty"
+else
+  not_ok "star stand-in fixture corpus is valid and non-empty"
+fi
+while IFS= read -r star_stand_in_fixture; do
+  star_stand_in_expected=$(printf '%s' "$star_stand_in_fixture" | jq -r '.expected_status')
+  star_stand_in_name=$(printf '%s' "$star_stand_in_fixture" \
+    | jq -r '.classification + ": " + .description')
+  for star_stand_in_host in claude codex; do
+    case "$star_stand_in_host" in
+      codex) star_stand_in_shape='{tool_name:"Bash",tool_input:{command:$c,workdir:$d}}' ;;
+      *) star_stand_in_shape='{tool_name:"Bash",tool_input:{command:$c},cwd:$d}' ;;
+    esac
+    printf '%s' "$star_stand_in_fixture" \
+      | jq -c --arg d "$star_stand_in_dir" ".command as \$c | $star_stand_in_shape" \
+      | AGENT_GUARD_HOOK_HOST=$star_stand_in_host "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool \
+        >"$OUT" 2>"$ERR"
+    star_stand_in_status=$?
+    if [ "$star_stand_in_status" -eq "$star_stand_in_expected" ] \
+      && { [ "$star_stand_in_expected" -eq 0 ] \
+        || grep -Fq 'reason=bash_protected_path_text_match' "$ERR"; }; then
+      ok "[$star_stand_in_host] $star_stand_in_name"
+    else
+      not_ok "[$star_stand_in_host] $star_stand_in_name (expected $star_stand_in_expected, got $star_stand_in_status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+done <"$star_stand_in_cases"
 
 expect_json_status 2 "literal bang-prefixed denied path remains blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"cat '\''!secret.pem'\''"}}' \
@@ -1619,6 +1955,8 @@ expect_json_status 0 "WebSearch benign query is allowed" \
   '{"tool_name":"WebSearch","tool_input":{"query":"agent guard documentation"}}' \
   hook-pre-tool
 
+run_expect 0 "prompt assignment errors follow infrastructure policy" sh "$ROOT/tests/prompt-assignment-failure.sh"
+
 # --- Prompt guard (hook-user-prompt) ---------------------------------------
 # Ground truth: default mode must block a secret-bearing prompt on BOTH hosts
 # and must pass a benign prompt untouched. Neither host supports rewriting the
@@ -1640,13 +1978,6 @@ PASSWORD=not-a-real-password' \
   '{prompt:$prompt}')
 prompt_guard_placeholder_lookalike_json=$(jq -nc \
   --arg prompt 'API_KEY=example_token_value_long' '{prompt:$prompt}')
-
-prompt_guard_case() { # $1 host, $2 prompt mode ('' = default), $3 pii mode ('' = off), $4 json
-  printf '%s' "$4" \
-    | AGENT_GUARD_HOOK_HOST="$1" AGENT_GUARD_PROMPT_GUARD_MODE="$2" \
-      AGENT_GUARD_PII_HOOK_MODE="$3" \
-      "$PLUGIN_ROOT/bin/agent-guard" hook-user-prompt
-}
 
 for pg_h in claude codex; do
   run_expect 2 "prompt guard blocks a pasted secret by default ($pg_h)" \
@@ -1692,6 +2023,162 @@ for pg_h in claude codex; do
 
   run_expect 2 "prompt guard dies loudly on an unsupported mode ($pg_h)" \
     prompt_guard_case "$pg_h" nonsense '' '{"prompt":"hello"}'
+done
+
+# Claude Code also submits messages nobody typed (a background task's
+# notification, a subagent hand-back). Blocking one must still block, name what
+# was lost without echoing the value, and tell the model on the next prompt
+# that passes; an ordinary blocked prompt queues nothing.
+injected_case() { # $1 session id, $2 prompt
+  jq -nc --arg s "$1" --arg p "$2" '{session_id:$s, prompt:$p}' \
+    | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_PROMPT_GUARD_MODE= AGENT_GUARD_PII_HOOK_MODE= \
+      AGENT_GUARD_WARNING_DIR="$TESTTMP/injected-warnings" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-user-prompt
+}
+injected_handback=$(printf '<agent-message from="a1b2c3d4">\n[Subagent hand-back] The report follows:\n  DB_PASSWORD=%s\n' "$prompt_guard_fake_value")
+injected_case inj-handback "$injected_handback" >"$OUT" 2>"$ERR"
+if [ $? -eq 2 ] && grep -q 'blocked a subagent hand-back from agent a1b2c3d4' "$ERR" \
+   && grep -q 'KEY=value or key: value assignment' "$ERR" \
+   && ! grep -q "$prompt_guard_fake_value" "$ERR" "$OUT"; then
+  ok "prompt guard names a blocked subagent hand-back without its value"
+else
+  not_ok "prompt guard names a blocked subagent hand-back without its value"
+  sed 's/^/  stdout: /' "$OUT"; sed 's/^/  stderr: /' "$ERR"
+fi
+injected_case inj-handback 'what happened to the report?' >"$OUT" 2>"$ERR"
+if [ $? -eq 0 ] \
+   && jq -e '.hookSpecificOutput.additionalContext
+             | test("blocked a subagent hand-back from agent a1b2c3d4 earlier")
+               and test("ask agent a1b2c3d4 to resend")' "$OUT" >/dev/null 2>&1 \
+   && ! grep -q "$prompt_guard_fake_value" "$OUT"; then
+  ok "prompt guard tells the model about a blocked hand-back on the next prompt"
+else
+  not_ok "prompt guard tells the model about a blocked hand-back on the next prompt"
+  sed 's/^/  stdout: /' "$OUT"; sed 's/^/  stderr: /' "$ERR"
+fi
+injected_case inj-handback 'and now?' >"$OUT" 2>"$ERR"
+if [ $? -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "prompt guard delivers a blocked-injection notice once"
+else
+  not_ok "prompt guard delivers a blocked-injection notice once"
+  sed 's/^/  stdout: /' "$OUT"; sed 's/^/  stderr: /' "$ERR"
+fi
+
+injected_task_file=/tmp/claude-1/-repo/0a1b2c3d-0000-4000-8000-000000000000/tasks/b9x8y7.output
+injected_task=$(printf '<task-notification>\n<task-id>b9x8y7</task-id>\n<output-file>%s</output-file>\n<status>completed</status>\n<result>my key is AGENT_GUARD_TEST_SECRET</result>\n</task-notification>' "$injected_task_file")
+injected_case inj-task "$injected_task" >"$OUT" 2>"$ERR"
+if [ $? -eq 2 ] && grep -q 'background task notification (task b9x8y7)' "$ERR" \
+   && grep -q 'gitleaks rule' "$ERR" && grep -qF "read $injected_task_file with the Read tool" "$ERR" \
+   && ! grep -q 'AGENT_GUARD_TEST_SECRET' "$ERR" "$OUT"; then
+  ok "prompt guard points a blocked task notification at its output file"
+else
+  not_ok "prompt guard points a blocked task notification at its output file"
+  sed 's/^/  stdout: /' "$OUT"; sed 's/^/  stderr: /' "$ERR"
+fi
+injected_case inj-task 'continue' >/dev/null 2>&1
+injected_forged=$(printf '<task-notification>\n<task-id>b9x8y7</task-id>\n<output-file>/etc/b9x8y7.output</output-file>\n<result>my key is AGENT_GUARD_TEST_SECRET</result>\n</task-notification>')
+injected_case inj-forged "$injected_forged" >"$OUT" 2>"$ERR"
+if [ $? -eq 2 ] && grep -q 'read that task output file' "$ERR" && ! grep -q '/etc/' "$ERR"; then
+  ok "prompt guard does not echo an output path outside the task layout"
+else
+  not_ok "prompt guard does not echo an output path outside the task layout"
+  sed 's/^/  stdout: /' "$OUT"; sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Ids and the output path reach the block reason, the queue file and the
+# model, so a secret-like or overlong one is dropped, not echoed.
+injected_long_id=abcdefghijklmnopqrstuvwxyz0123456789
+for injected_secretish in \
+  "$(printf '<agent-message from="AGENT_GUARD_TEST_SECRET">\n[Subagent hand-back] The report follows:\n  my key is AGENT_GUARD_TEST_SECRET\n')" \
+  "$(printf '<agent-message from="%s">\n[Subagent hand-back] The report follows:\n  my key is AGENT_GUARD_TEST_SECRET\n' "$injected_long_id")" \
+  "$(printf '<task-notification>\n<task-id>AGENT_GUARD_TEST_SECRET</task-id>\n<result>my key is AGENT_GUARD_TEST_SECRET</result>\n</task-notification>')" \
+  "$(printf '<task-notification>\n<task-id>b1</task-id>\n<output-file>/tmp/AGENT_GUARD_TEST_SECRET/x/tasks/b1.output</output-file>\n<result>my key is AGENT_GUARD_TEST_SECRET</result>\n</task-notification>')"; do
+  rm -rf "$TESTTMP/injected-warnings"
+  injected_case inj-secretish "$injected_secretish" >"$OUT" 2>"$ERR"
+  injected_block_status=$?
+  injected_queue=$(cat "$TESTTMP"/injected-warnings/blocked-injection-* 2>/dev/null)
+  injected_case inj-secretish 'next' >"$OUT.next" 2>/dev/null
+  if [ "$injected_block_status" -eq 2 ] && [ -n "$injected_queue" ] \
+     && ! grep -q "AGENT_GUARD_TEST_SECRET\|$injected_long_id" "$ERR" "$OUT.next" \
+     && ! printf '%s' "$injected_queue" | grep -q "AGENT_GUARD_TEST_SECRET\|$injected_long_id" \
+     && jq -e '.hookSpecificOutput.additionalContext | test("blocked a ")' "$OUT.next" >/dev/null 2>&1; then
+    ok "prompt guard drops a secret-like or overlong id or path from the notice"
+  else
+    not_ok "prompt guard drops a secret-like or overlong id or path from the notice"
+    sed 's/^/  stderr: /' "$ERR"; sed 's/^/  next: /' "$OUT.next"
+  fi
+done
+
+# The queue is read back into the model's context, so a warnings directory
+# that is not private to this user is refused rather than trusted.
+mkdir -p "$TESTTMP/injected-shared"
+chmod 755 "$TESTTMP/injected-shared"
+printf '%s' "$injected_handback" | jq -Rsc '{session_id:"inj-shared", prompt:.}' \
+  | AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_PROMPT_GUARD_MODE= AGENT_GUARD_PII_HOOK_MODE= \
+    AGENT_GUARD_WARNING_DIR="$TESTTMP/injected-shared" \
+    "$PLUGIN_ROOT/bin/agent-guard" hook-user-prompt >"$OUT" 2>"$ERR"
+injected_shared_status=$?
+if [ "$injected_shared_status" -eq 2 ] && [ -z "$(ls -A "$TESTTMP/injected-shared")" ]; then
+  ok "prompt guard queues nothing in a warnings directory that is not 0700"
+else
+  not_ok "prompt guard queues nothing in a warnings directory that is not 0700"
+  ls -la "$TESTTMP/injected-shared"
+fi
+
+injected_case inj-human 'my key is AGENT_GUARD_TEST_SECRET' >"$OUT" 2>"$ERR"
+injected_status=$?
+injected_case inj-human 'retrying without it' >"$OUT" 2>"$ERR"
+injected_next_status=$?
+if [ "$injected_status" -eq 2 ] && [ "$injected_next_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "prompt guard queues no notice for a typed prompt"
+else
+  not_ok "prompt guard queues no notice for a typed prompt"
+  sed 's/^/  stdout: /' "$OUT"; sed 's/^/  stderr: /' "$ERR"
+fi
+
+# Prose from real hand-backs that the assignment probe blocked: a placeholder
+# in angle brackets, and a config word with a Korean particle glued on. The
+# same shapes with a random value must keep blocking.
+injected_random_letters=$(od -An -N20 -tu1 /dev/urandom \
+  | awk '{ for (i = 1; i <= NF; i++) printf "%c", 97 + $i % 26 }')
+for prose in \
+  '- the docs say refresh-token: enabled가 켜져 있으면 silent refresh 합니다.' \
+  '- values look like `x-access-token:<token>` in the config' \
+  '- set `api_token: <your-api-token>`, then rerun' \
+  '- 값은 refresh-token: <token>, 그리고 저장' \
+  '- the flag is api_token: true가 켜져 있으면'; do
+  run_expect 0 "prompt guard allows prose: $prose" \
+    prompt_guard_case claude '' '' "$(jq -nc --arg p "$prose" '{prompt:$p}')"
+done
+recall_n=0
+for recall in \
+  "- api_token: <$injected_random_letters>" \
+  "- refresh-token: ${prompt_guard_fake_value}가 켜져 있으면" \
+  "- refresh-token: enabled$prompt_guard_fake_value" \
+  "- api_token: $prompt_guard_fake_value."; do
+  recall_n=$((recall_n + 1))
+  run_expect 2 "prompt guard still blocks a random value in a prose shape ($recall_n)" \
+    prompt_guard_case claude '' '' "$(jq -nc --arg p "$recall" '{prompt:$p}')"
+done
+
+# A config word or placeholder with a non-prose suffix, and an arbitrary word
+# in angle brackets, are values: only quoting, a comma and a known particle
+# come off before the benign checks. Both the prompt guard and output masking
+# share the classifier.
+for suffixed in 'true비밀' 'none패스워드' 'Enabled!' 'disabled.' 'dummy_password!' \
+                '<aBcDeFgHiJkL>' '<correct-horse-battery>'; do
+  run_expect 2 "prompt guard blocks a suffixed or non-placeholder value: $suffixed" \
+    prompt_guard_case claude '' '' "$(jq -nc --arg p "- set api_token: $suffixed" '{prompt:$p}')"
+  jq -nc --arg t "api_token: $suffixed" \
+    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$t,stderr:"",interrupted:false,isImage:false}}' \
+    | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=claude \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+  if [ $? -eq 0 ] && grep -q 'REDACTED' "$OUT" && ! grep -qF -- "$suffixed" "$OUT"; then
+    ok "post-tool masks a suffixed or non-placeholder value: $suffixed"
+  else
+    not_ok "post-tool masks a suffixed or non-placeholder value: $suffixed"
+    sed 's/^/  out: /' "$OUT"
+  fi
 done
 
 # A malformed host payload is an infrastructure failure, not a benign empty
@@ -2191,6 +2678,21 @@ expect_json_status 2 "assignment-prefixed git --no-verify is blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"FOO=bar git commit --no-verify -m x"}}' \
   hook-pre-tool
 
+# The flag inside code another shell or env -S runs is still the flag.
+for nv_command in "bash -c 'git commit --no-verify -m x'" "env -S 'git push --no-verify'"; do
+  for nv_host in claude codex; do
+    jq -nc --arg c "$nv_command" '{tool_name:"Bash",tool_input:{command:$c}}' \
+      | AGENT_GUARD_HOOK_HOST=$nv_host "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+    nv_status=$?
+    if [ "$nv_status" -eq 2 ] && grep -q 'disables hooks/signing' "$ERR"; then
+      ok "[$nv_host] $nv_command is blocked"
+    else
+      not_ok "[$nv_host] $nv_command is blocked (got $nv_status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+done
+
 # Rank 3: cloud / secrets-manager credential-dump siblings.
 expect_json_status 2 "gcloud auth print-access-token is blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"gcloud auth print-access-token"}}' \
@@ -2519,6 +3021,37 @@ expect_json_status 2 "Read .env.d.ts runtime variant stays blocked" \
   '{"tool_name":"Read","tool_input":{"file_path":".env.d.ts"}}' \
   hook-pre-tool
 
+# A settings module named env.py is source code on every surface, and a
+# directory named `env` does not make its children protected. A directory
+# matching a dotenv rule still protects a source-module name inside it.
+expect_json_status 0 "Read nested settings env.py source module is allowed" \
+  '{"tool_name":"Read","tool_input":{"file_path":"pkg/app/settings/env.py"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Bash git add of a nested settings env.py is allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"git add pkg/app/settings/env.py"}}' \
+  hook-pre-tool
+
+expect_json_status 0 "Read a file under an env directory is allowed" \
+  '{"tool_name":"Read","tool_input":{"file_path":"pkg/env/settings.py"}}' \
+  hook-pre-tool
+
+# CR, VT and FF inside a quoted word split nothing; re-parsing such a word for
+# hidden cwd changes must terminate instead of recursing on the same token.
+for env_blankless_ws in '\r' '\u000b' '\f'; do
+  expect_json_status 0 "Bash quoted word with $env_blankless_ws terminates the cwd re-parse" \
+    "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo \\\"a${env_blankless_ws}b\\\" && cat pkg/app/settings/env.py\"}}" \
+    hook-pre-tool
+done
+
+expect_json_status 2 "Read env.py inside a .env directory stays blocked" \
+  '{"tool_name":"Read","tool_input":{"file_path":"config/.env/env.py"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash git add of a runtime .env.local stays blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"git add pkg/app/.env.local"}}' \
+  hook-pre-tool
+
 expect_json_status 2 "Read env.local.json data file stays blocked" \
   '{"tool_name":"Read","tool_input":{"file_path":"env.local.json"}}' \
   hook-pre-tool
@@ -2789,6 +3322,193 @@ expect_json_status 2 "Bash env template cannot bypass a built-in SSH key deny" \
   '{"tool_name":"Bash","tool_input":{"command":"cat .ssh/id_rsa.env.example"}}' \
   hook-pre-tool
 
+# --- Claude block reason JSON (#294, #297) -----------------------------------
+# On Claude Code >= 2.1.214 (read from AI_AGENT) a blocking hook keeps exit 2
+# and its stderr and adds a JSON reason on stdout, so the host shows the reason
+# instead of "[<hooks.json command>]: <stderr>", and a blocked prompt is not
+# echoed back. Every other host, version or unknown version must stay
+# byte-for-byte stderr-only: before 2.1.214 an exit-2 hook with JSON that failed
+# schema validation could stop blocking.
+cbr_new=claude-code_2-1-289_harness
+cbr_dir="$TESTTMP/claude-block-reason"
+mkdir -p "$cbr_dir/stop-repo"
+git -C "$cbr_dir/stop-repo" init -q
+printf 'token = AGENT_GUARD_TEST_SECRET\n' >"$cbr_dir/stop-repo/untracked.txt"
+cbr_pre_json='{"session_id":"cbr-pre","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"config/.env.local"}}'
+cbr_ups_json='{"session_id":"cbr-ups","hook_event_name":"UserPromptSubmit","prompt":"my key is AGENT_GUARD_TEST_SECRET"}'
+cbr_stop_json=$(jq -nc --arg d "$cbr_dir/stop-repo" \
+  '{session_id:"cbr-stop",hook_event_name:"Stop",stop_hook_active:false,cwd:$d}')
+
+cbr_run() { # $1 host, $2 AI_AGENT ('' = unset), $3 subcommand, $4 json, $5 output prefix
+  if [ -n "$2" ]; then
+    printf '%s' "$4" | AI_AGENT="$2" AGENT_GUARD_HOOK_HOST="$1" \
+      "$PLUGIN_ROOT/bin/agent-guard" "$3" >"$5.out" 2>"$5.err"
+  else
+    printf '%s' "$4" | env -u AI_AGENT AGENT_GUARD_HOOK_HOST="$1" \
+      "$PLUGIN_ROOT/bin/agent-guard" "$3" >"$5.out" 2>"$5.err"
+  fi
+}
+
+cbr_check_json() { # $1 name, $2 subcommand, $3 json, $4 jq shape test
+  cbr_run claude '' "$2" "$3" "$cbr_dir/base"
+  cbr_base_status=$?
+  cbr_run claude "$cbr_new" "$2" "$3" "$cbr_dir/new"
+  cbr_status=$?
+  if [ "$cbr_base_status" -eq 2 ] && [ "$cbr_status" -eq 2 ] \
+     && [ ! -s "$cbr_dir/base.out" ] && [ -s "$cbr_dir/base.err" ] \
+     && cmp -s "$cbr_dir/base.err" "$cbr_dir/new.err" \
+     && [ "$(jq -s 'length' <"$cbr_dir/new.out" 2>/dev/null)" = 1 ] \
+     && jq -e --rawfile e "$cbr_dir/new.err" "$4" "$cbr_dir/new.out" >/dev/null 2>&1 \
+     && ! grep -q 'my key is' "$cbr_dir/new.out"; then
+    ok "$1"
+  else
+    not_ok "$1 (status $cbr_base_status/$cbr_status)"
+    sed 's/^/  stdout: /' "$cbr_dir/new.out"; sed 's/^/  stderr: /' "$cbr_dir/new.err"
+  fi
+}
+
+cbr_check_json "Claude >= 2.1.214 PreToolUse block adds a deny reason equal to stderr" \
+  hook-pre-tool "$cbr_pre_json" \
+  '.hookSpecificOutput == {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: ($e | rtrimstr("\n"))}'
+cbr_check_json "Claude >= 2.1.214 prompt block adds a reason and suppressOriginalPrompt" \
+  hook-user-prompt "$cbr_ups_json" \
+  '. == {decision: "block", reason: ($e | rtrimstr("\n")), hookSpecificOutput: {hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true}}'
+cbr_check_json "Claude >= 2.1.214 Stop block adds a block reason equal to stderr" \
+  hook-stop "$cbr_stop_json" \
+  '. == {decision: "block", reason: ($e | rtrimstr("\n"))}'
+
+# Boundary and newer versions get the JSON (must-pass).
+for cbr_agent in claude-code_2-1-214_harness claude-code_2-2-0_harness claude-code_3-0-0_agent; do
+  cbr_run claude "$cbr_agent" hook-pre-tool "$cbr_pre_json" "$cbr_dir/v"
+  if [ $? -eq 2 ] && jq -e '.hookSpecificOutput.permissionDecision == "deny"' "$cbr_dir/v.out" >/dev/null 2>&1; then
+    ok "Claude block reason JSON is added for AI_AGENT=$cbr_agent"
+  else
+    not_ok "Claude block reason JSON is added for AI_AGENT=$cbr_agent"
+    sed 's/^/  stdout: /' "$cbr_dir/v.out"; sed 's/^/  stderr: /' "$cbr_dir/v.err"
+  fi
+done
+
+# Older, unknown or malformed versions and other hosts stay stderr-only
+# (must-fail: any stdout here could turn a block into a pass on an old host).
+for cbr_case in \
+  "claude|claude-code_2-1-213_harness" "claude|claude-code_1-9-999_harness" \
+  "claude|" "claude|garbage" "claude|claude-code_2-1-x_harness" \
+  "claude|claude-code_2-1-9999999_harness" "claude|claude-code_2-1_harness" \
+  "codex|$cbr_new"; do
+  cbr_host=${cbr_case%%|*}
+  cbr_agent=${cbr_case#*|}
+  for cbr_sub in hook-pre-tool hook-user-prompt hook-stop; do
+    case "$cbr_sub" in
+      hook-pre-tool) cbr_json=$cbr_pre_json ;;
+      hook-user-prompt) cbr_json=$cbr_ups_json ;;
+      *) cbr_json=$cbr_stop_json ;;
+    esac
+    cbr_run claude '' "$cbr_sub" "$cbr_json" "$cbr_dir/base"
+    cbr_run "$cbr_host" "$cbr_agent" "$cbr_sub" "$cbr_json" "$cbr_dir/v"
+    cbr_status=$?
+    if [ "$cbr_status" -eq 2 ] && [ ! -s "$cbr_dir/v.out" ] \
+       && cmp -s "$cbr_dir/base.err" "$cbr_dir/v.err"; then
+      ok "$cbr_sub stays stderr-only for host=$cbr_host AI_AGENT='$cbr_agent'"
+    else
+      not_ok "$cbr_sub stays stderr-only for host=$cbr_host AI_AGENT='$cbr_agent' (status $cbr_status)"
+      sed 's/^/  stdout: /' "$cbr_dir/v.out"; sed 's/^/  stderr: /' "$cbr_dir/v.err"
+    fi
+  done
+done
+
+# Pass-through: allowed calls, unknown tools and a handler's own stdout are untouched.
+cbr_run claude "$cbr_new" hook-pre-tool \
+  '{"session_id":"cbr-ok","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"README.md"}}' "$cbr_dir/v"
+if [ $? -eq 0 ] && [ ! -s "$cbr_dir/v.out" ]; then
+  ok "Claude block reason capture passes an allowed tool call silently"
+else
+  not_ok "Claude block reason capture passes an allowed tool call silently"
+  sed 's/^/  stdout: /' "$cbr_dir/v.out"; sed 's/^/  stderr: /' "$cbr_dir/v.err"
+fi
+cbr_run claude "$cbr_new" hook-pre-tool \
+  '{"session_id":"cbr-unknown","hook_event_name":"PreToolUse","tool_name":"FutureTool","tool_input":{"anything":1}}' "$cbr_dir/v"
+if [ $? -eq 0 ] && [ ! -s "$cbr_dir/v.out" ]; then
+  ok "Claude block reason capture passes an unknown tool through"
+else
+  not_ok "Claude block reason capture passes an unknown tool through"
+  sed 's/^/  stdout: /' "$cbr_dir/v.out"; sed 's/^/  stderr: /' "$cbr_dir/v.err"
+fi
+# A non-blocking exit that only writes stderr must not gain a JSON reason:
+# decision "block" on exit 0 would itself block.
+cbr_run claude "$cbr_new" hook-stop \
+  '{"session_id":"cbr-active","hook_event_name":"Stop","stop_hook_active":true}' "$cbr_dir/v"
+if [ $? -eq 0 ] && [ ! -s "$cbr_dir/v.out" ] && [ -s "$cbr_dir/v.err" ]; then
+  ok "Claude block reason capture adds no JSON to a stderr-only exit 0"
+else
+  not_ok "Claude block reason capture adds no JSON to a stderr-only exit 0"
+  sed 's/^/  stdout: /' "$cbr_dir/v.out"; sed 's/^/  stderr: /' "$cbr_dir/v.err"
+fi
+
+# An allowed PreToolUse that writes its own JSON (here the infra-policy notice
+# for a commit whose target cannot be resolved) must be byte-for-byte the same
+# with and without the capture.
+mkdir -p "$cbr_dir/ctx-repo"
+git -C "$cbr_dir/ctx-repo" init -q
+for cbr_agent in '' "$cbr_new"; do
+  cbr_tag=${cbr_agent:+new}
+  # The notice is shown once per session, so each run needs fresh session ids.
+  jq -nc --arg d "$cbr_dir/ctx-repo" --arg s "cbr-ctx-${cbr_tag:-base}-${TESTTMP##*.}" \
+    --arg c 'git -C "$(pwd)" commit -m x' \
+    '{session_id:$s,hook_event_name:"PreToolUse",tool_name:"Bash",tool_input:{command:$c},cwd:$d}' \
+    >"$cbr_dir/ctx.json"
+  cbr_run claude "$cbr_agent" hook-pre-tool "$(cat "$cbr_dir/ctx.json")" "$cbr_dir/ctx-${cbr_tag:-base}"
+  printf '%s\n' "$?" >"$cbr_dir/ctx-${cbr_tag:-base}.status"
+done
+if [ "$(cat "$cbr_dir/ctx-base.status")" = 0 ] && [ "$(cat "$cbr_dir/ctx-new.status")" = 0 ] \
+   && jq -e '.hookSpecificOutput.additionalContext' "$cbr_dir/ctx-base.out" >/dev/null 2>&1 \
+   && cmp -s "$cbr_dir/ctx-base.out" "$cbr_dir/ctx-new.out" \
+   && cmp -s "$cbr_dir/ctx-base.err" "$cbr_dir/ctx-new.err"; then
+  ok "Claude block reason capture keeps an allowed PreToolUse's own stdout byte-for-byte"
+else
+  not_ok "Claude block reason capture keeps an allowed PreToolUse's own stdout byte-for-byte"
+  sed 's/^/  base stdout: /' "$cbr_dir/ctx-base.out"; sed 's/^/  new stdout: /' "$cbr_dir/ctx-new.out"
+  sed 's/^/  new stderr: /' "$cbr_dir/ctx-new.err"
+fi
+
+printf '%s' "$cbr_ups_json" | AI_AGENT="$cbr_new" AGENT_GUARD_HOOK_HOST=claude \
+  AGENT_GUARD_PROMPT_GUARD_MODE=warn "$PLUGIN_ROOT/bin/agent-guard" hook-user-prompt \
+  >"$cbr_dir/v.out" 2>"$cbr_dir/v.err"
+if [ $? -eq 0 ] && [ "$(jq -s 'length' <"$cbr_dir/v.out" 2>/dev/null)" = 1 ] \
+   && jq -e '.systemMessage and (has("decision") | not)' "$cbr_dir/v.out" >/dev/null 2>&1; then
+  ok "Claude block reason capture keeps a non-blocking hook's own JSON unchanged"
+else
+  not_ok "Claude block reason capture keeps a non-blocking hook's own JSON unchanged"
+  sed 's/^/  stdout: /' "$cbr_dir/v.out"; sed 's/^/  stderr: /' "$cbr_dir/v.err"
+fi
+
+# Fail-closed paths keep exit 2: malformed host input still blocks, now with a reason.
+cbr_run claude "$cbr_new" hook-pre-tool '"not an object"' "$cbr_dir/v"
+if [ $? -eq 2 ] && jq -e '.hookSpecificOutput.permissionDecisionReason | contains("not a JSON object")' \
+     "$cbr_dir/v.out" >/dev/null 2>&1; then
+  ok "Claude block reason capture keeps a malformed-input block at exit 2"
+else
+  not_ok "Claude block reason capture keeps a malformed-input block at exit 2"
+  sed 's/^/  stdout: /' "$cbr_dir/v.out"; sed 's/^/  stderr: /' "$cbr_dir/v.err"
+fi
+
+# The Git hook entry point (scan-staged) is not a host hook and is unaffected.
+mkdir -p "$cbr_dir/git-repo"
+git -C "$cbr_dir/git-repo" init -q
+printf 'token = AGENT_GUARD_TEST_SECRET\n' >"$cbr_dir/git-repo/staged.txt"
+git -C "$cbr_dir/git-repo" add staged.txt
+(cd "$cbr_dir/git-repo" && AI_AGENT="$cbr_new" "$PLUGIN_ROOT/bin/agent-guard" scan-staged) \
+  >"$cbr_dir/v.out" 2>"$cbr_dir/v.err"
+cbr_status=$?
+if [ "$cbr_status" -ne 0 ] && ! grep -q 'permissionDecision\|"decision"' "$cbr_dir/v.out"; then
+  ok "Git hook scan-staged output is unaffected by AI_AGENT"
+else
+  not_ok "Git hook scan-staged output is unaffected by AI_AGENT (status $cbr_status)"
+  sed 's/^/  stdout: /' "$cbr_dir/v.out"; sed 's/^/  stderr: /' "$cbr_dir/v.err"
+fi
+
+fi # end of shard 1
+
+if in_shard 2; then
 # Rank 8: shell builtins that print the whole environment.
 expect_json_status 2 "export -p is blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"export -p"}}' \
@@ -3551,6 +4271,55 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+# Compound lines whose commit or push the scan can follow reach the staged
+# scan in closed mode: a cd after gh, a continued line, a here-document only
+# gh reads, and a $HOME or ~ variable. The secret repository still blocks.
+compound_clean="$TMP_ROOT/compound-clean"
+git init -q "$compound_clean"
+for compound_case in "$TEST_REPO 2" "$compound_clean 0"; do
+  compound_repo=${compound_case% *}
+  compound_want=${compound_case##* }
+  for shell_cmd in \
+    "gh auth status 2>&1 | grep -E scopes; cd $compound_repo && git push -q origin HEAD:release/x 2>&1 | tail -2; git ls-remote origin release/x" \
+    "cd $compound_repo && git add README.md && git commit -S -q -m docs && git push -q -u origin HEAD" \
+    "$(printf 'cd %s && \\\ngit commit -q -m docs' "$compound_repo")" \
+    "$(printf 'cat > %s/b.md <<%s\nRan `npm test`\nEOF\n/opt/homebrew/bin/gh pr edit 1 --body-file %s/b.md; git -C %s push' "$TMP_ROOT" "'EOF'" "$TMP_ROOT" "$compound_repo")" \
+    "R=\$HOME/${compound_repo#"$TMP_ROOT"/}; git -C \$R commit -q -m docs" \
+    "R=~/${compound_repo#"$TMP_ROOT"/}; git -C \$R commit -q -m docs"; do
+    jq -nc --arg command "$shell_cmd" --arg cwd "$TMP_ROOT" \
+      '{tool_name:"Bash",cwd:$cwd,tool_input:{command:$command}}' \
+      | HOME="$TMP_ROOT" AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+          "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+    status=$?
+    if [ "$compound_want" -eq 2 ]; then
+      if [ "$status" -eq 2 ] && grep -q 'secret-like values' "$ERR"; then
+        ok "compound git command reaches the staged scan: ${shell_cmd%%[ ;]*}"
+      else
+        not_ok "compound git command reaches the staged scan: ${shell_cmd%%[ ;]*} (expected secret block, got $status)"
+        sed 's/^/  stderr: /' "$ERR"
+      fi
+    elif [ "$status" -eq 0 ] && ! grep -q 'agent-guard' "$ERR"; then
+      ok "compound git command in a clean repository passes: ${shell_cmd%%[ ;]*}"
+    else
+      not_ok "compound git command in a clean repository passes: ${shell_cmd%%[ ;]*} (got $status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+done
+
+# A repository this command creates does not exist when the hook runs.
+jq -nc --arg command "git init -q $TMP_ROOT/later; git -C $TMP_ROOT/later commit -q -m x" \
+  '{tool_name:"Bash",tool_input:{command:$command}}' \
+  | AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+status=$?
+if [ "$status" -eq 2 ] && grep -q 'does not exist or is not a git repository when the hook runs' "$ERR"; then
+  ok "a commit in a repository the same command creates says why it is blocked"
+else
+  not_ok "a commit in a repository the same command creates says why it is blocked (got $status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
 # Codex runs hooks from the task root, which can differ from exec_command's
 # workdir. Honor the tool payload so the staged scan runs in the target repo.
 (
@@ -3761,6 +4530,13 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+run_expect 0 "deny-read mask allow list shows only allowed values from a private user file" sh "$ROOT/tests/deny-read-mask-allow.sh"
+# The owner and permission checks differ by platform; keep their lines in the log.
+grep -E 'mode [0-9]|owned|owner|access control|directory above|work tree|HOME inside' "$OUT" | sed 's/^/  /'
+
+fi # end of shard 2
+
+if in_shard 3; then
 # `git commit -a`, a pathspec, --include and --only make Git stage tracked
 # work-tree changes after PreToolUse has run. The gate must scan what the
 # commit would record (must-fail), allow the same shapes when the unstaged
@@ -3780,6 +4556,7 @@ mkdir -p "$AUTOSTAGE_REPO/sub"
   printf 'n=1\n' > other.conf
   printf 's=1\n' > sub/nested.conf
   printf 'g=1\n' > '>'
+  printf 'h=1\n' > ';'
   git add .
   git commit -q -m init
   # An ignored file named like an option, for the glob case below.
@@ -3879,8 +4656,9 @@ autostage_case claude secret 2 'git commit -m x 2>&1 settings.conf'
 autostage_case claude secret 2 'git commit -m x {settings,other}.conf'
 # A subshell's closing parenthesis ends the arguments without hiding them.
 autostage_case codex secret 2 '(git commit -m x settings.conf)'
-# The scan cannot follow a shell cd, so a pathspec after one widens the scan.
+# The scan follows a shell cd, so a pathspec after one resolves against it.
 autostage_case claude secret 2 'cd sub && git commit -m x nested.conf' sub/nested.conf
+autostage_case codex clean 0 'cd sub && git commit -m x nested.conf' sub/nested.conf
 # --interactive can add untracked files, which no diff shows.
 autostage_case claude secret 2 "printf '4\\n1\\n\\n7\\n' | git commit --interactive -m x" untracked.conf
 autostage_case codex clean 0 "printf '4\\n1\\n\\n7\\n' | git commit --interactive -m x" untracked.conf
@@ -3889,6 +4667,8 @@ autostage_case claude secret 2 'git commit -m x -?'
 autostage_case codex clean 0 'git commit -m x -?'
 # A quoted pathspec that looks like a redirection is still a pathspec.
 autostage_case codex secret 2 "git commit -m x -- '>'" '>'
+autostage_case claude secret 2 "git commit -m x -- ';'" ';'
+autostage_case codex secret 0 "git commit -m x -- ';'" untracked.conf
 # The pathspec file lies outside the repository (closed policy: no false failure).
 printf 'settings.conf\n' >"$TMP_ROOT/autostage-pathspecs"
 autostage_case claude secret 2 "git commit -m x --pathspec-from-file $TMP_ROOT/autostage-pathspecs"
@@ -3916,6 +4696,39 @@ autostage_case claude secret 0 'git add sub/*.conf && git commit -m x' ignored.c
 autostage_case claude clean 0 'git commit -am x >/dev/null 2>&1'
 # Pathspecs resolve against the command cwd, not the repository root.
 autostage_case codex secret 2 'git commit -m x nested.conf' sub/nested.conf sub
+# The code a shell runs from -c or a here-string, and eval's arguments, go
+# through the same checks.
+for as_host in claude codex; do
+  for as_command in \
+    'bash -c "git commit -am x"' \
+    "sh -c 'git commit -am x'" \
+    "eval 'git commit -am x'" \
+    'eval git commit -am x' \
+    "bash -e -c 'true && git commit -am x' _" \
+    "bash <<< 'git commit -am x'" \
+    "env -S 'git commit -am x'" \
+    "bash<<<'git commit -am x'" \
+    'git>/dev/null commit -am x' \
+    'git 2>&1 commit -am x' \
+    "git commit -m ';' -a"
+  do
+    autostage_case "$as_host" secret 2 "$as_command"
+    autostage_case "$as_host" clean 0 "$as_command"
+  done
+done
+# An option value that may split may yield --interactive; a quoted one,
+# including the usual here-document message, is one word and adds no scan of
+# untracked files.
+autostage_case claude secret 2 "F='x --interactive'; printf '4\\n1\\n\\n7\\n' | git commit -m \$F" untracked.conf
+autostage_case codex clean 0 "F='x --interactive'; printf '4\\n1\\n\\n7\\n' | git commit -m \$F" untracked.conf
+autostage_case codex secret 2 "printf '4\\n1\\n\\n7\\n' | bash -c 'git commit -m \$1' _ 'x --interactive'" untracked.conf
+autostage_case claude secret 0 "F='x --interactive'; printf '4\\n1\\n\\n7\\n' | git commit -m \"\$F\"" untracked.conf
+autostage_case codex secret 0 "F='x --interactive'; printf '4\\n1\\n\\n7\\n' | git commit -m \"\${F:-x y}\"" untracked.conf
+autostage_case codex secret 0 "printf '4\\n1\\n\\n7\\n' | bash -c 'git commit -m \"\$1\"' _ 'x --interactive'" untracked.conf
+autostage_case claude secret 0 "git commit -m \"\$(cat <<'EOF'
+x --interactive
+EOF
+)\"" untracked.conf
 
 # A dynamic word may expand to -a, --interactive or a pathspec, so it widens
 # the scan to every tracked change and to untracked files.
@@ -3989,6 +4802,969 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+# A resolvable command variable stays resolvable whatever the locale and
+# whatever text its arguments carry: BSD awk fails on multibyte text under a
+# UTF-8 locale, and the gate read that failure as an unknown command name.
+# The cwd has a staged secret, so 0 means no commit was assumed; U means a
+# closed-policy block on an unknown command.
+VARCMD_REPO="$TMP_ROOT/varcmd"
+(
+  mkdir -p "$VARCMD_REPO" && cd "$VARCMD_REPO" || exit 2
+  git init -q
+  printf '%s\n' "AGENT_GUARD_TEST_SECRET" > settings.conf
+  git add settings.conf
+) || not_ok "varcmd: setup failed"
+varcmd_session=0
+# varcmd_case EXPECTED LOCALE COMMAND; C sets LC_ALL, others set LANG alone.
+varcmd_case() {
+  varcmd_session=$((varcmd_session + 1))
+  case "$2" in
+    C) set -- "$1" "$2" "$3" env LC_ALL=C ;;
+    *) set -- "$1" "$2" "$3" env -u LC_ALL -u LC_CTYPE LANG="$2" ;;
+  esac
+  case "$2" in
+    C.UTF-8|en_US.UTF-8) varcmd_filter='{session_id:$s,tool_name:"Bash",tool_input:{command:$c,workdir:$d}}'; varcmd_host=codex ;;
+    *) varcmd_filter='{session_id:$s,tool_name:"Bash",tool_input:{command:$c},cwd:$d}'; varcmd_host=claude ;;
+  esac
+  varcmd_name="var command [$varcmd_host $2]: $3"
+  varcmd_expected=$1
+  varcmd_command=$3
+  shift 3
+  jq -nc --arg c "$varcmd_command" --arg d "$VARCMD_REPO" --arg s "varcmd-$$-$varcmd_session" "$varcmd_filter" \
+    | (cd "$TMP_ROOT" && "$@" AGENT_GUARD_HOOK_HOST=$varcmd_host AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool) >"$OUT" 2>"$ERR"
+  varcmd_status=$?
+  case "$varcmd_expected:$varcmd_status" in
+    0:0) ok "$varcmd_name" ;;
+    U:2) if grep -q 'could not' "$ERR"; then ok "$varcmd_name"; else
+           not_ok "$varcmd_name (blocked, but not as unresolved)"; sed 's/^/  stderr: /' "$ERR"; fi ;;
+    *) not_ok "$varcmd_name (expected $varcmd_expected, got $varcmd_status)"; sed 's/^/  stderr: /' "$ERR" ;;
+  esac
+}
+varcmd_nfd=$(printf 'cafe\314\201')
+for varcmd_locale in C C.UTF-8 en_US.UTF-8 ja_JP.UTF-8; do
+  for varcmd_command in \
+    'T="mytool"; $T run "テスト"' \
+    'T="mytool"; "$T" run "テスト"' \
+    'T="mytool --profile dev"; $T run "δοκιμή"' \
+    "T=\"mytool\"; \$T call --data '{\"title\":\"확인 항목\"}'" \
+    'T="mytool"; $T log "■ step（1）「check」"' \
+    'T="mytool"; $T fill "café"' \
+    "T=\"mytool\"; \$T fill \"$varcmd_nfd\"" \
+    'T="mytool"; $T fill "ﾃｽﾄ 🎉"' \
+    'T="mytool"; V=$($T get --selector ".x" 2>&1 | tail -1); [ "$V" = "保存" ] || echo "失敗"' \
+    'T="mytool"; for i in 1 2; do $T call --data "{\"name\":\"項目${i}\"}"; done' \
+    "T=\"mytool\"; \$T click --selector \"[data-test='group-a'] [aria-label='メニューを開く']\"" \
+    "T=\"mytool\"; \$T click \":text('新規') >> nth=1\"" \
+    'T="mytool"; $T eval "document.title"' \
+    'T="mytool"; $T read x' \
+    'T="mytool"; $T source list' \
+    'T="mytool"; $T wait idle' \
+    'X=$(date +%s); T="mytool"; $T run' \
+    'X="$(date)"; T="mytool"; $T run' \
+    'X=$((1+2)); T="mytool"; $T run' \
+    'diff <(echo a) <(echo b); T="mytool"; $T run' \
+    "T=\"mytool\"; \$T click --selector '.card >> nth=0 >> img[src*=\"icon_v2\"]'" \
+    'T="mytool"; $T call --data "{\"email\":\"${EMAIL}\",\"password\":\"${PASS}\"}"' \
+    "T=\"mytool\"; \$T fill 'input[autocomplete=\"cc-number\"]' \"4242424242424242\"" \
+    "mytool eval \"document.querySelector('#popup')?.remove()\""
+  do
+    varcmd_case 0 "$varcmd_locale" "$varcmd_command"
+  done
+done
+# git or a shell behind the variable, or a word that hides git, stays unknown
+# in every locale. A builtin-named word is only safe as an argument of an
+# ordinary command; a paren closed before the assignment says nothing about
+# it, and one still open, or a condition, does. A brace group never counts as
+# closed: an argument } looks the same as the one that ends it. git anywhere
+# in the line, a forwarding function and a trap keep the variable unknown.
+# A ) in a here-document body closes nothing.
+varcmd_nl='
+'
+for varcmd_locale in C ja_JP.UTF-8; do
+  for varcmd_command in \
+    'G="git"; $G commit -m "日本語のメッセージ"' \
+    'G="git"; $G push origin HEAD' \
+    'S="bash"; $S -c "git commit -m x"' \
+    'G="gi""t"; $G commit -m "テスト"' \
+    'T="mytool"; eval "$T commit"' \
+    'T="git"; $T eval' \
+    'T=noglob; $T eval "X=git"; $X commit -m x' \
+    'X=$(T=git); $T commit' \
+    '( T="mytool" ); $T commit' \
+    '{ T="mytool"; }; $T commit' \
+    'false && { echo }; T=mytool; }; $T commit' \
+    'false && { echo }; T=mytool; }; $T --version' \
+    'f() { echo }; T=mytool; }; $T commit' \
+    'false && { printf "%s\n" a }; T=mytool; }; $T commit' \
+    'false && { echo ${X}}; T=mytool; }; $T commit' \
+    'true && T="mytool"; $T run' \
+    'X=$(case a in a) echo ;; esac; T=mytool); $T commit' \
+    'X=$( (T=mytool) ); $T commit' \
+    'T="mytool"; f() { "$@" 2>&1 | tail -1; }; V=$(f $T get --selector ".y")' \
+    'T="mytool"; on_exit() { "$T" summary || true; }; trap on_exit EXIT; $T run' \
+    "trap 'git commit -am x' EXIT; T=\"mytool\"; \$T run" \
+    'f() { git "$@"; }; f commit -m x' \
+    'T="mytool"; $T run; git commit -m "x"' \
+    "( cat <<E${varcmd_nl})${varcmd_nl}E${varcmd_nl}T=mytool${varcmd_nl}); \$T commit" \
+    "X=\$(cat <<E${varcmd_nl})${varcmd_nl}E${varcmd_nl}T=mytool${varcmd_nl}); \$T commit" \
+    "( cat <<'E'${varcmd_nl})${varcmd_nl}E${varcmd_nl}T=mytool${varcmd_nl}); \$T commit" \
+    "( cat <<-E${varcmd_nl}	)${varcmd_nl}	E${varcmd_nl}T=mytool${varcmd_nl}); \$T commit" \
+    "false && ( cat <<E${varcmd_nl})${varcmd_nl}E${varcmd_nl}T=mytool${varcmd_nl}); \$T commit"
+  do
+    varcmd_case U "$varcmd_locale" "$varcmd_command"
+  done
+done
+varcmd_case 0 C "T=mytool; cat <<E${varcmd_nl})${varcmd_nl}E${varcmd_nl}\$T run"
+expect_json_status 2 "a secret in an argument of a resolved command variable is still caught" \
+  '{"tool_name":"Bash","tool_input":{"command":"T=\"mytool\"; $T call --data \"{\\\"password\\\":\\\"AGENT_GUARD_TEST_SECRET\\\"}\""}}' \
+  hook-pre-tool
+# A resolver that cannot run is reported as such, not as an unknown name.
+varcmd_awk_dir="$TMP_ROOT/varcmd-awk-fail"
+mkdir -p "$varcmd_awk_dir"
+printf '#!/bin/sh\n[ -z "${GGCV_CMD+x}" ] || exit 2\nexec %s "$@"\n' "$(command -v awk)" > "$varcmd_awk_dir/awk"
+chmod +x "$varcmd_awk_dir/awk"
+jq -nc --arg d "$VARCMD_REPO" '{session_id:"varcmd-awk-fail",tool_name:"Bash",tool_input:{command:"T=mytool; $T run"},cwd:$d}' \
+  | (cd "$TMP_ROOT" && PATH="$varcmd_awk_dir:$PATH" AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool) >"$OUT" 2>"$ERR"
+varcmd_status=$?
+if [ "$varcmd_status" -eq 2 ] && grep -q 'awk failed' "$ERR"; then
+  ok "a failing command-variable resolver is reported as an awk failure"
+else
+  not_ok "a failing command-variable resolver is reported as an awk failure (got $varcmd_status)"
+  sed 's/^/  stderr: /' "$ERR"
+fi
+
+fi # end of shard 3
+
+if in_shard 2; then
+# A git alias runs the git command it expands to, read from the configuration
+# that command reads: its -c options and GIT_CONFIG_* variables, the repository
+# it runs in, include files and the global file. The hook runs with cwd=a and
+# the command is then really run there; both repositories' new commits are
+# searched for the marker.
+ALIAS_ROOT="$TMP_ROOT/alias"
+ALIAS_GLOBAL="$ALIAS_ROOT/global.gitconfig"
+mkdir -p "$ALIAS_ROOT"
+printf '[alias]\n\tgci = commit\n' >"$ALIAS_GLOBAL"
+for al_repo in a b; do
+  mkdir -p "$ALIAS_ROOT/$al_repo"
+  (
+    cd "$ALIAS_ROOT/$al_repo" || exit 2
+    git init -q
+    git config user.email test@example.com
+    git config user.name test
+    git config core.hooksPath "$TMP_ROOT/alias-no-hooks"
+    printf 'a=1\n' > settings.conf
+    printf 'n=1\n' > other.conf
+    git add .
+    git commit -q -m init
+  )
+done
+(
+  cd "$ALIAS_ROOT/a" || exit 2
+  git config alias.ci commit
+  git config alias.ca 'commit -a'
+  git config alias.c2 ci
+  git config alias.nv 'commit --no-verify'
+  git config alias.st 'status -s'
+  git config alias.sc '!git commit -m x'
+  # Git ignores an alias that hides a built-in command.
+  git config alias.status commit
+  printf '[alias]\n\tinc-ci = commit\n' > .git/alias.inc
+  git config include.path alias.inc
+)
+git -C "$ALIAS_ROOT/b" config alias.bci commit
+ALIAS_BASE_A=$(git -C "$ALIAS_ROOT/a" rev-parse HEAD)
+ALIAS_BASE_B=$(git -C "$ALIAS_ROOT/b" rev-parse HEAD)
+al_session=0
+
+# alias_case HOST MODE EXPECTED COMMAND [REPO]
+# MODE secret stages the marker in REPO (default a); autostage stages a benign
+# line and leaves the marker unstaged in a tracked file; clean stages a benign
+# line. EXPECTED is 0, 2 (blocked on the finding), N (blocked for disabling
+# hooks), or U0/U2: blocked under the closed policy because the alias cannot be
+# resolved, allowed with a notice under the open one, and the digit is the
+# ground truth.
+alias_case() {
+  al_host=$1
+  al_mode=$2
+  al_expected=$3
+  al_command=$4
+  al_repo=$ALIAS_ROOT/${5:-a}
+  al_name="git alias [$al_host] $al_mode: $al_command"
+  (
+    for al_reset in a:"$ALIAS_BASE_A" b:"$ALIAS_BASE_B"; do
+      cd "$ALIAS_ROOT/${al_reset%%:*}" || exit 2
+      git reset -q --hard "${al_reset#*:}" || exit 2
+    done
+    cd "$al_repo" || exit 2
+    case "$al_mode" in
+      secret) printf '%s\n' "AGENT_GUARD_TEST_SECRET" >> settings.conf ;;
+      *) printf 'c=3\n' >> settings.conf ;;
+    esac
+    git add settings.conf
+    [ "$al_mode" != autostage ] || printf '%s\n' "AGENT_GUARD_TEST_SECRET" >> other.conf
+  ) || { not_ok "$al_name (setup failed)"; return; }
+  case "$al_host" in
+    codex) al_filter='{session_id:$s,tool_name:"Bash",tool_input:{command:$c,workdir:$d}}' ;;
+    *) al_filter='{session_id:$s,tool_name:"Bash",tool_input:{command:$c},cwd:$d}' ;;
+  esac
+  case "$al_expected" in
+    U*) al_policies='open closed' ;;
+    *) al_policies=closed ;;
+  esac
+  # An inherited GIT_CONFIG_COUNT, _KEY_0 or _VALUE_0 would keep
+  # `${GIT_CONFIG_COUNT:=1}` and the like from assigning. GIT_CONFIG_GLOBAL
+  # points at the file with alias.gci.
+  for al_policy in $al_policies; do
+    al_session=$((al_session + 1))
+    jq -nc --arg c "$al_command" --arg d "$ALIAS_ROOT/a" --arg s "alias-$$-$al_session" "$al_filter" \
+      | (cd "$TMP_ROOT" && GIT_CONFIG_GLOBAL=$ALIAS_GLOBAL AGENT_GUARD_HOOK_HOST=$al_host \
+          AGENT_GUARD_INFRA_FAILURE_MODE=$al_policy \
+          env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+          "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool) >"$OUT" 2>"$ERR"
+    al_status=$?
+    if [ "$al_policy" = open ]; then
+      al_open_status=$al_status
+      cp "$ERR" "$ERR.open"
+    fi
+  done
+  (cd "$ALIAS_ROOT/a" && GIT_CONFIG_GLOBAL=$ALIAS_GLOBAL \
+    env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 bash -c "$al_command") >/dev/null 2>&1
+  al_leaks=0
+  for al_check in a:"$ALIAS_BASE_A" b:"$ALIAS_BASE_B"; do
+    if git -C "$ALIAS_ROOT/${al_check%%:*}" log -p "${al_check#*:}..HEAD" | grep -q AGENT_GUARD_TEST_SECRET; then
+      al_leaks=2
+    fi
+  done
+  case "$al_expected" in
+    U*)
+      if [ "$al_status" -ne 2 ] || ! grep -q 'could not' "$ERR"; then
+        not_ok "$al_name (expected an unresolved-alias block under the closed policy, got $al_status)"
+        sed 's/^/  stderr: /' "$ERR"
+      elif [ "$al_open_status" -ne 0 ] || ! grep -q 'could not' "$ERR.open"; then
+        not_ok "$al_name (expected the open policy to allow it with a notice, got $al_open_status)"
+        sed 's/^/  stderr: /' "$ERR.open"
+      elif [ "$al_leaks" -ne "${al_expected#U}" ]; then
+        not_ok "$al_name (ground truth disagrees: the command leaks=$al_leaks)"
+      else
+        ok "$al_name"
+      fi
+      ;;
+    N)
+      if [ "$al_status" -ne 2 ] || ! grep -q 'disables hooks' "$ERR"; then
+        not_ok "$al_name (expected a block for disabling hooks, got $al_status)"
+        sed 's/^/  stderr: /' "$ERR"
+      else
+        ok "$al_name"
+      fi
+      ;;
+    *)
+      if [ "$al_status" -ne "$al_expected" ]; then
+        not_ok "$al_name (expected $al_expected, got $al_status)"
+        sed 's/^/  stderr: /' "$ERR"
+      elif [ "$al_status" -eq 2 ] && ! grep -q 'contain secret-like values' "$ERR"; then
+        not_ok "$al_name (blocked, but not on a secret finding)"
+        sed 's/^/  stderr: /' "$ERR"
+      elif [ "$al_leaks" -ne "$al_expected" ]; then
+        not_ok "$al_name (ground truth disagrees: the command leaks=$al_leaks)"
+      else
+        ok "$al_name"
+      fi
+      ;;
+  esac
+}
+
+for al_host in claude codex; do
+  for al_command in \
+    'git -c alias.k=commit k -m x' \
+    'git ci -m x' \
+    'git gci -m x' \
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.k GIT_CONFIG_VALUE_0=commit git k -m x'
+  do
+    alias_case "$al_host" secret 2 "$al_command"
+    alias_case "$al_host" clean 0 "$al_command"
+  done
+  alias_case "$al_host" autostage 2 'git ca -m x'
+  alias_case "$al_host" clean 0 'git ca -m x'
+done
+alias_case claude autostage 2 "git -c 'alias.k=commit -m x' k other.conf"
+# An alias may name another alias, match in any case, or come from an include.
+alias_case codex secret 2 'git c2 -m x'
+alias_case claude secret 2 'git CI -m x'
+alias_case codex secret 2 'git inc-ci -m x'
+# The alias is read where the command runs, and in shell code it passes on.
+alias_case claude secret 2 'cd ../b && git bci -m x' b
+alias_case codex secret 2 'git -C ../b bci -m x' b
+alias_case claude secret 2 "bash -c 'git ci -m x'"
+# An alias that adds --no-verify is refused like the flag itself.
+alias_case codex clean N 'git nv -m x'
+# A shell alias, an autocorrected typo, and an alias the same line may change
+# or define in the environment cannot be resolved before the command runs.
+alias_case claude secret U2 'git sc'
+alias_case codex secret U2 'git -c help.autocorrect=immediate comit -m x'
+alias_case codex secret U2 'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.k GIT_CONFIG_VALUE_0=commit; git k -m x'
+alias_case claude secret U2 'set -a; : "${GIT_CONFIG_COUNT:=1}" "${GIT_CONFIG_KEY_0:=alias.k}" "${GIT_CONFIG_VALUE_0:=commit}"; git k -m x'
+alias_case claude secret U2 'git config alias.k commit && git k -m x'
+git -C "$ALIAS_ROOT/a" config --unset-all alias.k
+alias_case claude secret U2 "printf '[alias]\\n\\tk = commit\\n' >> .git/config && git k -m x"
+git -C "$ALIAS_ROOT/a" config --unset-all alias.k
+# Built-ins, plain aliases and unknown commands commit nothing: no notice.
+alias_case codex secret 0 'git status'
+alias_case claude secret 0 'git st'
+alias_case codex secret 0 'git nosuch'
+
+run_expect 0 "mask-file masks values per format and fails closed" sh "$ROOT/tests/mask-file.sh"
+run_expect 0 "deny-read mask mode returns a masked view or blocks without content" sh "$ROOT/tests/deny-read-mask.sh"
+run_expect 0 "deny-read mask rules mask matches or block without content" sh "$ROOT/tests/deny-read-mask-rules.sh"
+
+fi # end of shard 2
+
+if in_shard 5; then
+# A shell cd moves the commit to another repository: the scan must follow a
+# literal cd and fail per the infrastructure policy (closed here) on one it
+# cannot resolve. The hook runs with cwd=a; the command is then really run
+# there and both repositories' new commits are searched for the marker.
+SHELLCD_ROOT="$TMP_ROOT/shellcd"
+for sc_repo in a b; do
+  mkdir -p "$SHELLCD_ROOT/$sc_repo/sub"
+  (
+    cd "$SHELLCD_ROOT/$sc_repo" || exit 2
+    git init -q
+    git config user.email test@example.com
+    git config user.name test
+    git config core.hooksPath "$TMP_ROOT/autostage-no-hooks"
+    printf 'a=1\n' > settings.conf
+    printf 's=1\n' > sub/nested.conf
+    git add .
+    git commit -q -m init
+  )
+done
+SHELLCD_BASE_A=$(git -C "$SHELLCD_ROOT/a" rev-parse HEAD)
+SHELLCD_BASE_B=$(git -C "$SHELLCD_ROOT/b" rev-parse HEAD)
+sc_session=0
+ln -s ../b/sub "$SHELLCD_ROOT/a/link"
+printf '/link\n' >> "$SHELLCD_ROOT/a/.git/info/exclude"
+
+# shellcd_case HOST MODE EXPECTED COMMAND [REPO]
+# MODE secret stages the marker in REPO (default b); clean stages a benign
+# line. EXPECTED is 0, 2 (blocked on the finding), or U0/U2: blocked because
+# the working directory is unknown, allowed under the open policy, and the
+# digit is the ground truth under bash (HOME is b, so `cd` alone moves there),
+# or x where it differs between bash versions. UF is U2, except that the open
+# policy still blocks on the finding in another git command of the line.
+# SC_HOME replaces that HOME for both the hook and bash; `-` unsets it.
+sc_with_home() {
+  case "${SC_HOME-$SHELLCD_ROOT/b}" in
+    -) env -u HOME "$@" ;;
+    *) HOME=${SC_HOME-$SHELLCD_ROOT/b} "$@" ;;
+  esac
+}
+shellcd_case() {
+  sc_host=$1
+  sc_mode=$2
+  sc_expected=$3
+  sc_command=$4
+  in_navigation_host "$sc_host" || return 0
+  sc_repo=$SHELLCD_ROOT/${5:-b}
+  sc_name="shell cd [$sc_host] $sc_mode: $sc_command"
+  (
+    for sc_reset in a:"$SHELLCD_BASE_A" b:"$SHELLCD_BASE_B"; do
+      cd "$SHELLCD_ROOT/${sc_reset%%:*}" || exit 2
+      git reset -q --hard "${sc_reset#*:}" || exit 2
+    done
+    cd "$sc_repo" || exit 2
+    case "$sc_mode" in
+      secret) printf '%s\n' "AGENT_GUARD_TEST_SECRET" >> settings.conf ;;
+      *) printf 'c=3\n' >> settings.conf ;;
+    esac
+    git add settings.conf
+  ) || { not_ok "$sc_name (setup failed)"; return; }
+  # A fresh session per call: the infrastructure notice is printed once per
+  # session, and the default session key is shared with later tests.
+  case "$sc_host" in
+    codex) sc_filter='{session_id:$s,tool_name:"Bash",tool_input:{command:$c,workdir:$d}}' ;;
+    *) sc_filter='{session_id:$s,tool_name:"Bash",tool_input:{command:$c},cwd:$d}' ;;
+  esac
+  # Only an unknown cwd differs between the policies.
+  case "$sc_expected" in
+    U*) sc_policies='open closed' ;;
+    *) sc_policies=closed ;;
+  esac
+  for sc_policy in $sc_policies; do
+    sc_session=$((sc_session + 1))
+    jq -nc --arg c "$sc_command" --arg d "$SHELLCD_ROOT/a" --arg s "shellcd-$$-$sc_session" "$sc_filter" \
+      | (cd "$TMP_ROOT" && sc_with_home env AGENT_GUARD_HOOK_HOST=$sc_host AGENT_GUARD_INFRA_FAILURE_MODE=$sc_policy \
+          "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool) >"$OUT" 2>"$ERR"
+    sc_status=$?
+    if [ "$sc_policy" = open ]; then
+      sc_open_status=$sc_status
+      cp "$ERR" "$ERR.open"
+    fi
+  done
+  (cd "$SHELLCD_ROOT/a" && sc_with_home bash -c "$sc_command") >/dev/null 2>&1
+  sc_leaks=0
+  for sc_check in a:"$SHELLCD_BASE_A" b:"$SHELLCD_BASE_B"; do
+    if git -C "$SHELLCD_ROOT/${sc_check%%:*}" log -p "${sc_check#*:}..HEAD" | grep -q AGENT_GUARD_TEST_SECRET; then
+      sc_leaks=2
+    fi
+  done
+  case "$sc_expected" in
+    U*)
+      if [ "$sc_status" -ne 2 ] || ! grep -q 'could not' "$ERR"; then
+        not_ok "$sc_name (expected an unknown-cwd block under the closed policy, got $sc_status)"
+        sed 's/^/  stderr: /' "$ERR"
+      elif [ "$sc_expected" = UF ] && { [ "$sc_open_status" -ne 2 ] \
+          || ! grep -q 'contain secret-like values' "$ERR.open" || ! grep -q 'could not' "$ERR.open"; }; then
+        not_ok "$sc_name (expected the open policy to block on the finding with a notice, got $sc_open_status)"
+        sed 's/^/  stderr: /' "$ERR.open"
+      elif [ "$sc_expected" != UF ] && { [ "$sc_open_status" -ne 0 ] || ! grep -q 'could not' "$ERR.open"; }; then
+        not_ok "$sc_name (expected the open policy to allow it with a notice, got $sc_open_status)"
+        sed 's/^/  stderr: /' "$ERR.open"
+      elif [ "${sc_expected#U}" != x ] && [ "$sc_leaks" -ne "$(printf '%s' "${sc_expected#U}" | tr F 2)" ]; then
+        not_ok "$sc_name (ground truth disagrees: the command leaks=$sc_leaks)"
+      else
+        ok "$sc_name"
+      fi
+      ;;
+    *)
+      if [ "$sc_status" -ne "$sc_expected" ]; then
+        not_ok "$sc_name (expected $sc_expected, got $sc_status)"
+        sed 's/^/  stderr: /' "$ERR"
+      elif [ "$sc_status" -eq 2 ] && ! grep -q 'contain secret-like values' "$ERR"; then
+        not_ok "$sc_name (blocked, but not on a secret finding)"
+        sed 's/^/  stderr: /' "$ERR"
+      elif [ "$sc_leaks" -ne "$sc_expected" ]; then
+        not_ok "$sc_name (ground truth disagrees: the command leaks=$sc_leaks)"
+      else
+        ok "$sc_name"
+      fi
+      ;;
+  esac
+}
+
+for sc_host in claude codex; do
+  for sc_command in \
+    'cd ../b && git commit -m x' \
+    'cd ../b; git commit -m x' \
+    'git status && cd ../b && git commit -m x' \
+    'cd ../b 2>/dev/null && git commit -m x' \
+    '(cd ../b && git commit -m x)'
+  do
+    shellcd_case "$sc_host" secret 2 "$sc_command"
+    shellcd_case "$sc_host" clean 0 "$sc_command"
+  done
+done
+# A pathspec after the cd resolves against the new directory.
+shellcd_case claude secret 2 'cd ../b/sub && git commit -m x ../settings.conf'
+# A cd holds across separators, and a second one moves on from the first.
+shellcd_case codex secret 2 'cd .. && cd b && git commit -m x'
+# A subshell, a here-document and a comment do not move later commands.
+shellcd_case claude secret 0 '(cd ../b); git commit -m x'
+shellcd_case codex secret 2 '(cd ../b); git commit -m x' a
+shellcd_case claude secret 2 "cat >/dev/null <<'EOF'
+cd ../b
+EOF
+git commit -m x" a
+shellcd_case codex secret 2 'true # ; cd ../b
+git commit -m x' a
+# A cd whose target or effect only run time knows fails per the policy.
+shellcd_case claude secret U2 'cd $SC_UNSET_DIR && git commit -m x'
+# An unquoted `~` or `~/...` is HOME (b) before any other command (#341);
+# quoting after the first `/` does not stop the expansion.
+mkdir "$SHELLCD_ROOT/b/my dir"
+for sc_host in claude codex; do
+  for sc_command in \
+    'cd ~ && git commit -m x' \
+    'cd ~/sub && git commit -m x ../settings.conf' \
+    'cd ~/"my dir" && git commit -m x' \
+    'cd ~/s"u"b && git commit -m x ../settings.conf' \
+    'cd /tmp && cd ~ && git commit -m x' \
+    'SC_X=1 cd ~ && git commit -m x' \
+    'SC_X=1; cd ~ && git commit -m x' \
+    'cd ~ && git commit -m x && git push --dry-run origin main'
+  do
+    shellcd_case "$sc_host" secret 2 "$sc_command"
+    shellcd_case "$sc_host" clean 0 "$sc_command"
+  done
+  shellcd_case "$sc_host" clean 0 'cd ~/sub && git push --dry-run origin main'
+done
+rmdir "$SHELLCD_ROOT/b/my dir"
+# A quoted or escaped tilde is a literal directory in a, here a link back to
+# a, so following HOME instead would scan b while the commit lands in a.
+# bash keeps `~""` and `~"/sub"` literal; zsh expands them.
+ln -s . "$SHELLCD_ROOT/a/~"
+printf '/~\n' >> "$SHELLCD_ROOT/a/.git/info/exclude"
+for sc_command in \
+  'cd "~" && git commit -m x' \
+  "cd '~' && git commit -m x" \
+  'cd \~ && git commit -m x' \
+  'cd ~"" && git commit -m x' \
+  'cd "~/sub" && git commit -m x' \
+  'cd ~"/sub" && git commit -m x' \
+  'cd ~+ && git commit -m x' \
+  'SC_X=1 cd "~" && git commit -m x' \
+  'HOME=. ; cd ~ && git commit -m x' \
+  'export HOME=.; cd ~ && git commit -m x'
+do
+  shellcd_case claude secret U2 "$sc_command" a
+  shellcd_case codex secret U2 "$sc_command" a
+done
+# A tilde -C operand is left unresolved.
+for sc_host in claude codex; do
+  shellcd_case "$sc_host" secret U2 'git -C ~/sub commit -m x'
+  shellcd_case "$sc_host" secret U2 'git -C ~ commit -m x'
+done
+shellcd_case claude secret U0 'cd ~agent-guard-no-such-user && git commit -m x' a
+shellcd_case codex secret Ux 'cd ~- && git commit -m x' a
+shellcd_case claude secret Ux 'cd ~1 && git commit -m x' a
+shellcd_case codex secret Ux 'HOME=. cd ~ && git commit -m x' a
+# Any earlier command may change HOME; this one does not, but stays unknown.
+shellcd_case claude secret U2 'true; cd ~ && git commit -m x'
+# A command in a subshell cannot change this shell's HOME; one in the same
+# subshell as the cd can.
+for sc_host in claude codex; do
+  shellcd_case "$sc_host" secret 2 '(true); cd ~ && git commit -m x'
+  shellcd_case "$sc_host" clean 0 '(true); cd ~ && git commit -m x'
+  shellcd_case "$sc_host" secret U2 '(HOME=. ; cd ~ && git commit -m x)' a
+done
+# A HOME that is empty, unset or relative is not followed.
+SC_HOME=.
+shellcd_case codex secret U2 'cd ~ && git commit -m x' a
+SC_HOME=
+shellcd_case claude secret Ux 'cd ~ && git commit -m x' a
+SC_HOME=-
+shellcd_case codex secret Ux 'cd ~ && git commit -m x' a
+unset SC_HOME
+rm "$SHELLCD_ROOT/a/~"
+# A quoted tilde pathspec stays one literal path, so an untracked file outside
+# it is not scanned.
+printf '%s\n' "AGENT_GUARD_TEST_SECRET" > "$SHELLCD_ROOT/a/untracked.conf"
+for sc_host in claude codex; do
+  shellcd_case "$sc_host" clean 0 'git commit -m x -- "~nofile"' a
+  shellcd_case "$sc_host" clean 0 'git commit -m x -- \~nofile' a
+  shellcd_case "$sc_host" clean 0 "git commit -m x -- '~no file'" a
+  shellcd_case "$sc_host" clean 0 'git commit -m cd -- "~nofile"' a
+done
+rm "$SHELLCD_ROOT/a/untracked.conf"
+# Absolute and relative -C operands are still followed.
+for sc_host in claude codex; do
+  for sc_pair in secret:2 clean:0; do
+    shellcd_case "$sc_host" "${sc_pair%:*}" "${sc_pair#*:}" "git -C $SHELLCD_ROOT/b commit -m x"
+    shellcd_case "$sc_host" "${sc_pair%:*}" "${sc_pair#*:}" 'git -C sub commit -m x' a
+  done
+done
+shellcd_case claude secret U2 "cd \$'../b' && git commit -m x"
+# A continued line is one line.
+shellcd_case codex secret 2 'cd ../\
+b && git commit -m x'
+shellcd_case claude clean 0 'cd ../\
+b && git commit -m x'
+shellcd_case claude secret U2 'cd ../b && cd /tmp && cd - && git commit -m x'
+shellcd_case codex secret U2 'true && cd ../b; git commit -m x'
+shellcd_case claude secret U2 'false || cd ../b && git commit -m x'
+shellcd_case codex secret U2 '{ cd ../b; }; git commit -m x'
+shellcd_case claude secret U2 'if true; then cd ../b; fi; git commit -m x'
+shellcd_case codex secret U2 'builtin cd ../b && git commit -m x'
+# zsh runs the last pipeline element in the current shell; bash does not.
+shellcd_case claude secret U0 'true | cd ../b; git commit -m x'
+# A backgrounded cd runs in a subshell, so this commit stays in a.
+shellcd_case codex secret U2 'cd ../b & wait; git commit -m x' a
+# `..` after a symlink: logical under bash's default, physical under set -P.
+shellcd_case claude secret U0 'cd link/.. && git commit -m x'
+# A failed redirection or a brace-expanded extra operand skips the cd, so
+# following it would scan b while the commit stays in a.
+shellcd_case codex secret U2 'cd ../b <missing; git commit -m x' a
+# bash 3.2 ignores the extra operands; bash 5 and zsh refuse the cd (x: either).
+shellcd_case claude secret Ux 'cd ../b {x,y}; git commit -m x' a
+# A comment may follow a subshell's `)`, and `<<''` ends at the first empty line.
+shellcd_case claude secret 2 '(true)# ; cd ../b
+git commit -m x' a
+shellcd_case codex secret 2 "cat >/dev/null <<''
+x; cd ../b
+
+git commit -m x" a
+# In a `[[ =~ ]]` pattern, `(x)#` is regex, not a subshell and a comment.
+shellcd_case claude secret 2 '[[ x =~ (x)#y ]]; git commit -m x' a
+# Shell options do not move the cd target.
+shellcd_case codex secret 2 'set -e; cd ../b && git commit -m x'
+# A descriptor closed by exec makes the cd's `2>&1` fail, so the cd is skipped.
+shellcd_case claude secret U2 'exec 1>&-; cd ../b 2>&1; git commit -m x' a
+# An earlier command may relink the cd target after the scan resolved it.
+ln -s ../b "$SHELLCD_ROOT/a/relink"
+printf '/relink\n' >> "$SHELLCD_ROOT/a/.git/info/exclude"
+shellcd_case codex secret U2 'ln -sfn . relink && cd relink && git commit -m x' a
+# A commit that runs because its cd failed: the scan's cd fails the same way.
+shellcd_case claude secret U2 'cd missing || git commit -m x' a
+# A redirection before the command name does not hide the commit.
+shellcd_case codex secret 2 '>/dev/null git commit -m x' a
+# A shell's cd does not leave it, but an earlier cd, or env -C, applies to it;
+# eval runs in this shell, so its cd does move a later commit.
+shellcd_case claude secret 2 "bash -c 'cd ../b && git commit -m x'"
+shellcd_case codex secret 2 "cd ../b && bash -c 'git commit -m x'"
+shellcd_case claude secret 2 "env -C ../b sh -c 'git commit -m x'"
+shellcd_case codex secret 2 "bash -c 'cd ../b'; git commit -m x" a
+shellcd_case claude secret 0 "bash -c 'cd ../b'; git commit -m x"
+shellcd_case codex secret U2 "eval 'cd ../b'; git commit -m x"
+# A stray parenthesis in the script must not restore the outer subshell's cd.
+shellcd_case claude secret U2 "(cd ../b; bash -c ')'; git commit -m x)"
+# Code, a command name, or a git word only run time knows fails per the policy.
+shellcd_case codex secret U2 "bash -c '\$1' _ 'git commit -m x'" a
+shellcd_case claude secret U2 'G=git; $G commit -m x' a
+shellcd_case codex secret U2 '"$(command -v git)" commit -m x' a
+shellcd_case codex secret U2 "C='git commit -m x'; bash -c \"\$C\"" a
+shellcd_case claude secret U2 "C='git commit -m x'; eval \"\$C\"" a
+# eval parses a quoted operator among its arguments as one.
+shellcd_case codex secret 2 "eval true ';' 'git commit -m x'" a
+shellcd_case claude secret 2 "eval >/dev/null -- 'git commit -m x'" a
+shellcd_case codex secret U2 "C='git commit -m x'; env -S \"\$C\"" a
+shellcd_case claude secret U2 "env -S 'git\\_commit\\_-m\\_x'" a
+shellcd_case codex secret U2 "env -S 'git$(printf '\013')commit -m x'" a
+shellcd_case claude secret U2 "echo 'git commit -m x' | xargs -I{} sh -c '{}'" a
+shellcd_case codex secret U2 "X='commit -m x'; git \$X" a
+shellcd_case claude secret U2 "X='core.x=1 commit'; git -c \$X -m x" a
+shellcd_case codex secret U2 "X='V -C ../b'; env -u \$X git commit -m x"
+# A command name with a literal last component is that command.
+shellcd_case claude secret 2 'D=$(dirname "$(command -v git)"); "$D/git" commit -m x' a
+shellcd_case codex secret 2 "/usr/bin/env git commit -m x" a
+# A variable assigned once, earlier in the line, a plain literal that names an
+# ordinary command, is that command wherever it is the command name: a
+# user-built CLI held in a variable, in a function, behind a launcher.
+for sc_command in \
+  'CLI="echo"; $CLI sub arg' \
+  "CLI=\"echo --port 9223\"
+\$CLI pages x load" \
+  'CLI="echo"; run() { $CLI "$@"; }; run sub "$PWD"' \
+  'TOOL=./bin/mytool; $TOOL deploy' \
+  'CLI=echo; ${CLI} sub' \
+  'CLI=echo; "$CLI" sub "$PWD"' \
+  'CLI=echo; command $CLI sub "$PWD"' \
+  'CLI=echo; env $CLI sub "$PWD"' \
+  'CLI=echo; nice $CLI sub' \
+  'CLI=echo; time $CLI sub' \
+  'CLI=echo; xargs $CLI sub </dev/null' \
+  'RUNNER=npx; $RUNNER mytool sub' \
+  'CLI=echo; $CLI sub "$PWD" 2>&1 | tail -1' \
+  "set -e
+CLI=\"echo --port 9223\"
+export SC_SESSION=\"\$(basename \"\$PWD\")_\$\$\"
+\$CLI pages \"\$PWD\" load >/dev/null"
+do
+  shellcd_case claude secret 0 "$sc_command" a
+done
+# A quoted command word whose value is unknown is one word, git at worst: it
+# fails per the policy only when its arguments could commit or push.
+shellcd_case codex secret 0 '"$SC_UNSET" deploy --env prod' a
+shellcd_case claude secret 0 '"${SC_UNSET}" deploy' a
+for sc_command in \
+  'G=git; "$G" commit -m x' \
+  'G=git; "$G" -c alias.ci=commit ci -m x' \
+  'G=git; "$G" -C ../a commit -m x' \
+  'G=env; "$G" git commit -m x' \
+  "S=sh; printf 'git commit -m x\\n' | \"\$S\"" \
+  "S=sh; \"\$S\" <<<'git commit -m x'" \
+  "S=bash; \"\$S\" -c 'git commit -m x'" \
+  "S=sh; printf 'git commit -m x\\n' | { \"\$S\"; }" \
+  "S=sh; printf 'git commit -m x\\n' | ( \"\$S\" )" \
+  "S=sh; f() { \"\$S\"; }; printf 'git commit -m x\\n' | f"
+do
+  shellcd_case codex secret U2 "$sc_command" a
+done
+# A hook-skipping flag is blocked outright, whatever the command name.
+if in_navigation_host claude; then
+expect_json_status 2 "quoted unknown command word with a hook-skipping flag is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"G=git; \"$G\" commit --no-verify -m x"}}' \
+  hook-pre-tool
+fi
+# Anything else about the variable leaves the command name unknown.
+for sc_command in \
+  'X=$(echo git); $X commit -m x' \
+  'X=${SC_UNSET:-git}; $X commit -m x' \
+  'X=echo; X=git; $X commit -m x' \
+  "X=git; export X; bash -c '\$X commit -m x'" \
+  "X=echo; bash -c '\$X git commit -m x'" \
+  'X=echo; read X <<<git; $X commit -m x' \
+  'X=echo; unset X; $X git commit -m x' \
+  'X=echo; declare "$(printf X)=git"; $X commit -m x' \
+  'X=echo; f() { X=git; }; f; $X commit -m x' \
+  'false && X=echo; $X git commit -m x' \
+  '(X=echo); $X git commit -m x' \
+  '$X git commit -m x; X=echo' \
+  "X='env git'; \$X commit -m x" \
+  'IFS=_; X=git_commit; $X -m x' \
+  '$SC_UNSET git commit -m x' \
+  '_=echo; true "$(command -v git)"; $_ commit -m x' \
+  'REPLY=echo; read <<<git; $REPLY commit -m x' \
+  'OPTARG=echo; getopts a: o -agit; $OPTARG commit -m x'
+do
+  shellcd_case claude secret U2 "$sc_command" a
+done
+for sc_command in \
+  'X=$(true); $X commit -m x' \
+  'eval "$X commit -m x"' \
+  '$SC_UNSET commit -m x' \
+  '$SC_UNSET -C ../b push' \
+  '$SC_UNSET -c alias.ci=commit ci' \
+  '"$SC_UNSET" commit -m x' \
+  'X="g?t"; $X commit -m x' \
+  'MAPFILE=echo; mapfile -t <<<git; $MAPFILE commit -m x' \
+  'X=GIT; $X commit -m x' \
+  'X==git; $X commit -m x' \
+  "X=echo; alias e=eval; e \"\$(printf '\\\\x58')=git\"; \$X commit -m x" \
+  'exec <sc-no-such-input; "$SC_UNSET"'
+do
+  shellcd_case codex secret Ux "$sc_command" a
+done
+# The open policy still scans the git commands whose directory is known.
+shellcd_case claude secret UF 'git commit -m x; cd $SC_UNSET_DIR && git commit -m y' a
+shellcd_case codex secret UF 'eval "$(true)"; git commit -m x' a
+
+# A word whose name part is quoted or escaped is a command name, not an
+# assignment, so the cd after it is one of its arguments and git commits in a.
+for sc_host in claude codex; do
+  for sc_command in \
+    '"SC_X=1" cd ../b; git commit -m x' \
+    "'SC_X=1' cd ../b; git commit -m x" \
+    'SC_X\=1 cd ../b; git commit -m x' \
+    '\SC_X=1 cd ../b; git commit -m x' \
+    'SC_"X"=1 cd ../b; git commit -m x' \
+    "\"SC_X\"=1 cd $SHELLCD_ROOT/b; git commit -m x" \
+    'true; "SC_X=1" cd ../b; git commit -m x' \
+    '"SC_X=1">/dev/null cd ../b; git commit -m x' \
+    "'SC_X=\$X' true; git commit -m x" \
+    "bash -c '\"SC_X=1\" cd ../b; git commit -m x'"
+  do
+    shellcd_case "$sc_host" secret 2 "$sc_command" a
+    shellcd_case "$sc_host" clean 0 "$sc_command" a
+  done
+  # The unknown command may change the tree before the cd that follows it.
+  shellcd_case "$sc_host" secret U2 '"SC_X=1" true; cd ../b && git commit -m x'
+  # A glob may leave no word, so the next word may be the command name.
+  shellcd_case "$sc_host" secret 2 'shopt -s nullglob; "SC_X="agent-guard-no-such-* git commit -m x' a
+  shellcd_case "$sc_host" clean 0 'shopt -s nullglob; "SC_X="agent-guard-no-such-* git commit -m x' a
+  shellcd_case "$sc_host" secret U2 '"SC_X="agent-guard-no-such-* cd ../b; git commit -m x' a
+  # A quoted or escaped `$` or glob character cannot remove the word.
+  for sc_command in \
+    '"SC_X=$PWD" cd ../b; git commit -m x' \
+    '"SC_X="\* cd ../b; git commit -m x'
+  do
+    shellcd_case "$sc_host" secret 2 "$sc_command" a
+    shellcd_case "$sc_host" clean 0 "$sc_command" a
+  done
+  shellcd_case "$sc_host" secret 0 "shopt -s nullglob; 'SC_X=\$X' git commit -m x" a
+  shellcd_case "$sc_host" secret 2 "shopt -s nullglob; X='agent-guard-no-such-*'; \"SC_X=\"\$X git commit -m x" a
+  shellcd_case "$sc_host" clean 0 "shopt -s nullglob; X='agent-guard-no-such-*'; \"SC_X=\"\$X git commit -m x" a
+done
+# Unquoted names stay assignments, whatever the value's quoting.
+for sc_host in claude codex; do
+  for sc_command in \
+    "SC_X=1 cd $SHELLCD_ROOT/b; git commit -m x" \
+    'SC_X="1 2" cd ../b; git commit -m x' \
+    'SC_X="$PWD" cd ../b; git commit -m x' \
+    'SC_X=$PWD cd ../b; git commit -m x'
+  do
+    shellcd_case "$sc_host" secret 2 "$sc_command"
+    shellcd_case "$sc_host" clean 0 "$sc_command"
+  done
+  for sc_command in \
+    'GIT_CONFIG_NOSYSTEM=1 git commit -m x' \
+    'GIT_DIR=.git git commit -m x' \
+    '"GIT_DIR=.git" git commit -m x; git commit -m y'
+  do
+    shellcd_case "$sc_host" secret 2 "$sc_command" a
+    shellcd_case "$sc_host" clean 0 "$sc_command" a
+  done
+done
+
+# A command substitution inside double quotes runs too, where its command runs.
+# Each command runs under one host, alternating, to bound the shard's time.
+sc_nl='
+'
+sc_alt=codex
+sc_next_host() {
+  case "$sc_alt" in
+    claude) sc_alt=codex ;;
+    *) sc_alt=claude ;;
+  esac
+}
+for sc_command in \
+  'echo "$(git commit -m x)"' \
+  'SC_X="$(git commit -m x)"' \
+  'true "$(git commit -m x)"' \
+  '"SC_X=$(git commit -m x)" true' \
+  'echo "`git commit -m x`"' \
+  'echo "$(printf ")"; git commit -m x)"' \
+  "bash -c 'echo \"\$(git commit -m x)\"'" \
+  "echo \"\$(${sc_nl}git commit -m x${sc_nl})\"" \
+  'echo $(git commit -m x)'
+do
+  sc_next_host
+  shellcd_case "$sc_alt" secret 2 "$sc_command" a
+done
+for sc_alt in claude codex; do
+  shellcd_case "$sc_alt" clean 0 'echo "$(git commit -m x)"' a
+done
+for sc_command in \
+  'cd ../b && echo "$(git commit -m x)"' \
+  'echo "$(cd ../b && git commit -m x)"' \
+  "echo \"\$(cd ../b${sc_nl}git commit -m x)\""
+do
+  sc_next_host
+  shellcd_case "$sc_alt" secret 2 "$sc_command"
+done
+shellcd_case claude clean 0 'cd ../b && echo "$(git commit -m x)"'
+shellcd_case codex secret 0 'cd ../b && echo "$(git commit -m x)"' a
+# Text that only looks like one, and code that commits nothing, change nothing.
+for sc_command in \
+  'echo "$(date)"' \
+  "echo '\$(git commit -m x)'" \
+  'echo "\$(git commit -m x)"'
+do
+  sc_next_host
+  shellcd_case "$sc_alt" secret 0 "$sc_command" a
+done
+for sc_command in \
+  'git commit -m "$(git log -1 --format="%h %s")"' \
+  "git commit -m \"\$(cat <<'EOF'${sc_nl}fix: a thing${sc_nl}${sc_nl}More text (with parens) and \"quotes\".${sc_nl}EOF${sc_nl})\""
+do
+  for sc_alt in claude codex; do
+    shellcd_case "$sc_alt" secret 2 "$sc_command" a
+    shellcd_case "$sc_alt" clean 0 "$sc_command" a
+  done
+done
+# Text behind a quoted here-document delimiter that cat, tee or python reads
+# runs nothing; a shell reading it, or this shell expanding it, still does.
+for sc_command in \
+  "cat >/dev/null <<'EOF'${sc_nl}| \`tool land\` | \$(tool merge) |${sc_nl}git commit -m x${sc_nl}EOF" \
+  "python3 - <<'PY'${sc_nl}print('\`x\` \$(y) git commit -m x')${sc_nl}PY" \
+  "tee /dev/null <<\\EOF >/dev/null${sc_nl}(\`x\`)${sc_nl}EOF"
+do
+  sc_next_host
+  shellcd_case "$sc_alt" secret 0 "$sc_command" a
+done
+for sc_command in \
+  "bash <<'EOF'${sc_nl}git commit -m x${sc_nl}EOF" \
+  "cat <<'EOF' | bash${sc_nl}git commit -m x${sc_nl}EOF" \
+  "cat <<'EOF' \\${sc_nl}| bash${sc_nl}git commit -m x${sc_nl}EOF" \
+  "cat >sc-run.sh <<'EOF'${sc_nl}git commit -m x${sc_nl}EOF${sc_nl}bash sc-run.sh" \
+  "cat >sc-run.sh <<'EOF'${sc_nl}git commit -m x${sc_nl}EOF${sc_nl}. ./sc-run.sh"
+do
+  sc_next_host
+  shellcd_case "$sc_alt" secret 2 "$sc_command" a
+  shellcd_case "$sc_alt" clean 0 "$sc_command" a
+done
+sc_next_host
+shellcd_case "$sc_alt" secret U2 "bash <<'EOF'${sc_nl}\`echo git\` commit -m x${sc_nl}EOF" a
+sc_next_host
+shellcd_case "$sc_alt" secret 2 "cat >/dev/null <<EOF${sc_nl}\$(git commit -m x)${sc_nl}EOF" a
+shellcd_case "$sc_alt" clean 0 "cat >/dev/null <<EOF${sc_nl}\$(git commit -m x)${sc_nl}EOF" a
+# An unquoted variable git argument set to one plain word is that word; one
+# that may split stays unknown.
+for sc_command in \
+  'SC_R=../b; git -C $SC_R commit -m x' \
+  'SC_R=commit; git -C ../b $SC_R -m x'
+do
+  sc_next_host
+  shellcd_case "$sc_alt" secret 2 "$sc_command"
+  shellcd_case "$sc_alt" clean 0 "$sc_command"
+done
+sc_next_host
+shellcd_case "$sc_alt" secret 0 'SC_R=../b; git -C $SC_R log -1 >/dev/null; echo "$(git -C $SC_R branch --show-current)"'
+sc_next_host
+shellcd_case "$sc_alt" secret U2 "SC_R='../b commit'; git -C \$SC_R -m x"
+sc_next_host
+shellcd_case "$sc_alt" secret U0 "SC_R=../b; sh -c 'git -C \$SC_R commit -m x'"
+
+# Code in a quoted substitution may stage what a later commit takes.
+for sc_alt in claude codex; do
+  in_navigation_host "$sc_alt" || continue
+  for sc_mode in secret clean; do
+    (
+      cd "$SHELLCD_ROOT/a" || exit 2
+      git reset -q --hard "$SHELLCD_BASE_A"
+      case "$sc_mode" in
+        secret) printf '%s\n' "AGENT_GUARD_TEST_SECRET" >> settings.conf ;;
+        *) printf 'c=3\n' >> settings.conf ;;
+      esac
+    )
+    sc_command='echo "$(git add settings.conf)"; git commit -m x'
+    sc_session=$((sc_session + 1))
+    jq -nc --arg c "$sc_command" --arg d "$SHELLCD_ROOT/a" --arg s "shellcd-$$-$sc_session" \
+      '{session_id:$s,tool_name:"Bash",tool_input:{command:$c},cwd:$d}' \
+      | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=$sc_alt AGENT_GUARD_INFRA_FAILURE_MODE=closed \
+          "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool) >"$OUT" 2>"$ERR"
+    sc_status=$?
+    (cd "$SHELLCD_ROOT/a" && bash -c "$sc_command") >/dev/null 2>&1
+    sc_leaks=0
+    git -C "$SHELLCD_ROOT/a" log -p "$SHELLCD_BASE_A..HEAD" | grep -q AGENT_GUARD_TEST_SECRET && sc_leaks=2
+    sc_name="shell cd [$sc_alt] $sc_mode: $sc_command"
+    case "$sc_mode" in
+      secret) sc_want=2 ;;
+      *) sc_want=0 ;;
+    esac
+    if [ "$sc_status" -ne "$sc_want" ] || [ "$sc_leaks" -ne "$sc_want" ]; then
+      not_ok "$sc_name (expected $sc_want, got $sc_status; the command leaks=$sc_leaks)"
+      sed 's/^/  stderr: /' "$ERR"
+    else
+      ok "$sc_name"
+    fi
+  done
+done
+
+# GIT_DIR and GIT_WORK_TREE, or --git-dir and --work-tree, choose the
+# repository a commit uses; one only run time knows fails per the policy.
+for sc_command in \
+  'GIT_DIR=../b/.git GIT_WORK_TREE=../b git commit -m x' \
+  'GIT_DIR=../b/.git git commit -m x' \
+  'env GIT_DIR=../b/.git GIT_WORK_TREE=../b git commit -m x' \
+  'git --git-dir=../b/.git --work-tree=../b commit -m x' \
+  'git --git-dir ../b/.git --work-tree ../b commit -m x'
+do
+  sc_next_host
+  shellcd_case "$sc_alt" secret 2 "$sc_command"
+done
+for sc_alt in claude codex; do
+  shellcd_case "$sc_alt" clean 0 'GIT_DIR=../b/.git GIT_WORK_TREE=../b git commit -m x'
+done
+shellcd_case claude secret 0 'GIT_DIR=../b/.git GIT_WORK_TREE=../b git commit -m x' a
+shellcd_case codex secret 2 'GIT_WORK_TREE=../b git commit -m x' a
+shellcd_case claude secret U2 'GIT_DIR="$PWD/../b/.git" GIT_WORK_TREE=../b git commit -m x'
+shellcd_case codex secret U2 'export GIT_DIR=../b/.git GIT_WORK_TREE=../b; git commit -m x'
+shellcd_case claude secret U2 'GIT_DIR=~/.git git commit -m x'
+shellcd_case codex secret U0 'GIT_DIR=../b/.git env -u GIT_DIR git commit -m x'
+
+# The push gate follows the cd too. Nothing is committed, so the verdict is
+# checked against the same command with git -C, which the gate already follows.
+if in_navigation_host claude; then
+for sc_command in 'cd ../b; git push' 'git -C ../b push'; do
+  for sc_mode in secret clean; do
+    (
+      cd "$SHELLCD_ROOT/b" || exit 2
+      git reset -q --hard "$SHELLCD_BASE_B"
+      case "$sc_mode" in
+        secret) printf '%s\n' "AGENT_GUARD_TEST_SECRET" >> settings.conf ;;
+        *) printf 'c=3\n' >> settings.conf ;;
+      esac
+      git add settings.conf
+    )
+    jq -nc --arg c "$sc_command" --arg d "$SHELLCD_ROOT/a" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}' \
+      | (cd "$TMP_ROOT" && AGENT_GUARD_INFRA_FAILURE_MODE=closed "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool) >"$OUT" 2>"$ERR"
+    status=$?
+    case "$sc_mode" in secret) sc_expected=2 ;; *) sc_expected=0 ;; esac
+    if [ "$status" -eq "$sc_expected" ]; then
+      ok "shell cd push $sc_mode: $sc_command"
+    else
+      not_ok "shell cd push $sc_mode: $sc_command (expected $sc_expected, got $status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+done
+fi
+
+fi # end of shard 5
+
+if in_shard 4; then
 SYMLINK_REPO="$TMP_ROOT/symlink-repo"
 mkdir -p "$SYMLINK_REPO"
 (
@@ -4029,6 +5805,11 @@ mkdir -p "$TEMPLATE_SYMLINK_REPO/nested"
   ln -s .env .env.example
   ln -s .env sample.env
   ln -s ../.env nested/template.env
+  ln -s ../.env nested/env.py
+  # `cd hop/../other` enters ./other logically; realpath would see deep/other.
+  mkdir -p deep/inner other
+  ln -s deep/inner hop
+  ln -s ../.env other/env.py
 )
 # Genuine regular-file template in a separate dir: must stay allowed. Ordinary
 # example content, not a symlink, no real secret alongside it.
@@ -4037,6 +5818,9 @@ mkdir -p "$GENUINE_TEMPLATE_REPO/nested"
 printf 'API_TOKEN=your-token-here\n' > "$GENUINE_TEMPLATE_REPO/.env.example"
 printf 'API_TOKEN=your-token-here\n' > "$GENUINE_TEMPLATE_REPO/sample.env"
 printf 'API_TOKEN=your-token-here\n' > "$GENUINE_TEMPLATE_REPO/nested/template.env"
+mkdir -p "$GENUINE_TEMPLATE_REPO/pkg/app/settings"
+printf 'API_TOKEN_KEY = "API_TOKEN"\n' > "$GENUINE_TEMPLATE_REPO/nested/env.py"
+printf 'API_TOKEN_KEY = "API_TOKEN"\n' > "$GENUINE_TEMPLATE_REPO/pkg/app/settings/env.py"
 
 if [ -L "$TEMPLATE_SYMLINK_REPO/.env.example" ]; then
   # Repro: cat of the template-named symlink must now be BLOCKED (#132).
@@ -4184,6 +5968,47 @@ if [ -L "$TEMPLATE_SYMLINK_REPO/.env.example" ]; then
     not_ok "Bash direct relative genuine template stays allowed (expected 0, got $status)"
     sed 's/^/  stderr: /' "$ERR"
   fi
+
+  run_expect 0 "static source-module prose keeps executable inputs protected" \
+    "$REAL_SH" "$ROOT/tests/source-module-prose.sh"
+
+  # One cwd change to a static directory is resolvable: a relative exception
+  # token must be safe from both the event workdir and that directory. Source
+  # modules such as a settings `env.py` then stay usable after the common
+  # `cd <repo> &&` / `git -C <repo>` prefixes, while a symlink behind the same
+  # name is still caught, and ambiguous bases stay conservative.
+  for env_cwd_case in \
+    "2|$TEMPLATE_SYMLINK_REPO|cd ./nested && cat env.py|inline cd cannot hide a source-module symlink" \
+    "2|$TEMPLATE_SYMLINK_REPO|git -C nested add env.py|git -C cannot hide a source-module symlink" \
+    "2|$TMP_ROOT|cd $TEMPLATE_SYMLINK_REPO/nested && cat env.py|absolute cd cannot hide a source-module symlink" \
+    "2|$TEMPLATE_SYMLINK_REPO|env -C nested cat env.py|env -C cannot hide a source-module symlink" \
+    "2|$TEMPLATE_SYMLINK_REPO|cd hop/../other && cat env.py|logical cd through a symlink stays conservative" \
+    "2|$TEMPLATE_SYMLINK_REPO|cd >cd.log ./nested && cat env.py|redirection before the cd operand stays conservative" \
+    "2|$TEMPLATE_SYMLINK_REPO|git -C 2>/dev/null nested add env.py|redirection before the -C operand stays conservative" \
+    "2|$GENUINE_TEMPLATE_REPO|export C'D'PATH=/tmp; cd nested && cat env.py|bare cd target stays conservative (CDPATH, cdable_vars)" \
+    "2|$GENUINE_TEMPLATE_REPO|. ./switch.sh; cd ./nested && cat env.py|sourced script stays conservative" \
+    "2|$GENUINE_TEMPLATE_REPO|command source ./switch.sh && cat nested/env.py|sourced script without cd stays conservative" \
+    "2|$TEMPLATE_SYMLINK_REPO|eval \"cd nested && cat env.py >/dev/null\"|eval-quoted cd cannot hide a source-module symlink" \
+    "2|$TEMPLATE_SYMLINK_REPO|bash -c \"cd nested && cat template.env\"|sh -c quoted cd cannot hide a template symlink" \
+    "0|$TEMPLATE_SYMLINK_REPO|echo \"rename the env.py module later\"|prose naming a source module stays allowed" \
+    "0|$GENUINE_TEMPLATE_REPO|cd ./nested && cat env.py|inline cd keeps a genuine source module readable" \
+    "0|$TMP_ROOT|cd $GENUINE_TEMPLATE_REPO && git add pkg/app/settings/env.py|absolute cd keeps git add of a source module allowed" \
+    "0|$TMP_ROOT|git -C $GENUINE_TEMPLATE_REPO add pkg/app/settings/env.py|git -C keeps git add of a source module allowed" \
+    "0|$GENUINE_TEMPLATE_REPO|cd ./nested && cat template.env|inline cd keeps a genuine template readable" \
+    "2|$GENUINE_TEMPLATE_REPO|cd \$DIR && cat env.py|dynamic cd target stays conservative" \
+    "2|$GENUINE_TEMPLATE_REPO|cd ./nested && cd /tmp && cat env.py|two cwd changes stay conservative" \
+    "2|$GENUINE_TEMPLATE_REPO|cd ~/nested && cat env.py|tilde cd target stays conservative" \
+    "2|$GENUINE_TEMPLATE_REPO|cd nested && git add env.py .env.local|cd does not unblock a runtime dotenv"; do
+    env_cwd_expect=${env_cwd_case%%|*}
+    env_cwd_rest=${env_cwd_case#*|}
+    env_cwd_workdir=${env_cwd_rest%%|*}
+    env_cwd_rest=${env_cwd_rest#*|}
+    env_cwd_command=${env_cwd_rest%%|*}
+    expect_json_status "$env_cwd_expect" "Bash ${env_cwd_rest#*|}" \
+      "$(jq -nc --arg workdir "$env_cwd_workdir" --arg command "$env_cwd_command" \
+        '{tool_name:"Bash",tool_input:{command:$command,workdir:$workdir}}')" \
+      hook-pre-tool
+  done
 else
   say "skipping #132 template-symlink test: filesystem does not support symlinks"
 fi
@@ -5452,8 +7277,22 @@ fi
 exec "$AGENT_GUARD_TEST_REAL_GIT" "$@"
 EOSH
 chmod +x "$DIFF_FAIL_BIN/git"
+# A staged secret, so status 3 means the diff failed rather than a finding.
+DIFF_FAIL_REPO="$TMP_ROOT/diff-fail-repo"
+mkdir -p "$DIFF_FAIL_REPO"
 (
-  cd "$TEST_REPO" || exit 2
+  cd "$DIFF_FAIL_REPO" || exit 2
+  git init -q
+  git config user.email test@example.com
+  git config user.name test
+  printf '%s\n' "clean" > README.md
+  git add README.md
+  git commit -q -m init
+  printf '%s\n' "AGENT_GUARD_TEST_SECRET" > staged.txt
+  git add staged.txt
+)
+(
+  cd "$DIFF_FAIL_REPO" || exit 2
   PATH="$DIFF_FAIL_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
     "$PLUGIN_ROOT/bin/agent-guard" scan-staged >"$OUT" 2>"$ERR"
 )
@@ -5464,7 +7303,7 @@ else
   not_ok "scan-staged reports unavailable on git diff failure (expected 3, got $status)"
 fi
 (
-  cd "$TEST_REPO" || exit 2
+  cd "$DIFF_FAIL_REPO" || exit 2
   PATH="$DIFF_FAIL_BIN:$PATH" AGENT_GUARD_TEST_REAL_GIT="$REAL_GIT" \
     "$PLUGIN_ROOT/bin/agent-guard" scan-working-tree >"$OUT" 2>"$ERR"
 )
@@ -6091,6 +7930,9 @@ run_expect 0 "direct scan dependency statuses and recovery" \
   "$REAL_SH" "$ROOT/tests/direct-scan-status.sh"
 run_expect 0 "deterministic gitleaks resolution and capability diagnostics" \
   "$REAL_SH" "$ROOT/tests/gitleaks-resolution.sh"
+run_expect 0 "gitleaks readiness cache reuses only a fresh verdict for the same binary" \
+  env AGENT_GUARD_TEST_REAL_GITLEAKS="$REAL_GITLEAKS" \
+  "$REAL_SH" "$ROOT/tests/gitleaks-probe-cache.sh"
 run_expect 0 "setup and manifest hook outcome contracts" \
   "$REAL_SH" "$ROOT/tests/hook-outcome-contract.sh"
 
@@ -6813,10 +8655,11 @@ if [ -x "$RELEASE_TARBALL_DIR/out/bin/agent-guard" ] \
    && [ -x "$RELEASE_TARBALL_DIR/out/install.sh" ] \
    && [ -f "$RELEASE_TARBALL_DIR/out/deployment/claude-managed-settings.example.json" ] \
    && cmp -s "$ROOT/README.md" "$RELEASE_TARBALL_DIR/out/README.md" \
-   && cmp -s "$ROOT/docs/demo.gif" "$RELEASE_TARBALL_DIR/out/docs/demo.gif"; then
-  ok "release tarball contains the CLI, installer, managed settings, and exact consolidated README with demo"
+   && cmp -s "$ROOT/docs/demo.gif" "$RELEASE_TARBALL_DIR/out/docs/demo.gif" \
+   && cmp -s "$ROOT/docs/assets/icon.png" "$RELEASE_TARBALL_DIR/out/docs/assets/icon.png"; then
+  ok "release tarball contains the CLI, installer, managed settings, and exact consolidated README with demo and icon"
 else
-  not_ok "release tarball contains the CLI, installer, managed settings, and exact consolidated README with demo"
+  not_ok "release tarball contains the CLI, installer, managed settings, and exact consolidated README with demo and icon"
 fi
 run_expect 0 "extracted release installer check resolves the archive layout" \
   sh -c 'cd "$1" && ./install.sh check' _ "$RELEASE_TARBALL_DIR/out"
@@ -9207,6 +11050,89 @@ EOSH
     sed 's/^/  stderr: /' "$ERR"
   fi
 
+  # The real scanner must pass [MASKED] under secret-named keys in every
+  # format, and still catch a token someone left in a comment.
+  MASK_REAL_DIR="$TMP_ROOT/mask-real"
+  mkdir -p "$MASK_REAL_DIR"
+  # Match the CLI's physical paths (macOS /var alias and trailing TMPDIR slash).
+  MASK_REAL_DIR=$(CDPATH= cd -- "$MASK_REAL_DIR" && pwd -P)
+  mask_real_value() { od -An -N12 -tx1 /dev/urandom | tr -d ' \n'; }
+  printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nGITHUB_TOKEN=%s\nexport API_KEY="%s"\npassword=%s\nDATABASE_URL=%s\n' \
+    "$(mask_real_value)" "$(mask_real_value)" "$(mask_real_value)" \
+    "$(mask_real_value)" "$(mask_real_value)" "$(mask_real_value)" >"$MASK_REAL_DIR/.env"
+  printf '{"api_key":"%s","client_secret":"%s","private_key":"%s","nested":{"token":"%s"}}\n' \
+    "$(mask_real_value)" "$(mask_real_value)" "$(mask_real_value)" "$(mask_real_value)" \
+    >"$MASK_REAL_DIR/secrets.json"
+  printf 'db:\n  password: %s\n  api_token: "%s"\n' "$(mask_real_value)" "$(mask_real_value)" \
+    >"$MASK_REAL_DIR/secrets.yaml"
+  printf '//registry.npmjs.org/:_authToken=%s\n' "$(mask_real_value)" >"$MASK_REAL_DIR/.npmrc"
+  for mask_real_name in .env secrets.json secrets.yaml .npmrc; do
+    jq -nc --arg p "$MASK_REAL_DIR/$mask_real_name" '{tool_name:"Read",tool_input:{file_path:$p}}' \
+      | AGENT_GUARD_DENY_READ_MODE=mask AGENT_GUARD_GITLEAKS_BIN="$REAL_GITLEAKS" \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+    status=$?
+    if [ "$status" -eq 2 ] && grep -Fq 'agent-guard: masked view follows' "$ERR"; then
+      ok "real gitleaks passes the masked view of $mask_real_name"
+    else
+      not_ok "real gitleaks passes the masked view of $mask_real_name (status $status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+  mkdir -p "$MASK_REAL_DIR/comment"
+  printf '# old: ghp_%s%s\nK=%s\n' "$(mask_real_value)" "$(mask_real_value | cut -c1-12)" \
+    "$(mask_real_value)" >"$MASK_REAL_DIR/comment/.env"
+  jq -nc --arg p "$MASK_REAL_DIR/comment/.env" '{tool_name:"Read",tool_input:{file_path:$p}}' \
+    | AGENT_GUARD_DENY_READ_MODE=mask AGENT_GUARD_GITLEAKS_BIN="$REAL_GITLEAKS" \
+      "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+  status=$?
+  if [ "$status" -eq 2 ] && grep -Fqx 'agent-guard: no masked view: the masked view still contains secret-like text' "$ERR" \
+     && ! grep -Fq 'ghp_' "$ERR"; then
+    ok "real gitleaks refuses a masked view with a token left in a comment"
+  else
+    not_ok "real gitleaks refuses a masked view with a token left in a comment (status $status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+
+  # A value the allow list shows is rescanned: the real scanner flags a token
+  # under an allowed key, and the view falls back to every value masked.
+  MASK_ALLOW_HOME="$MASK_REAL_DIR/allow-home"
+  mkdir -p "$MASK_ALLOW_HOME/.config/agent-guard" "$MASK_REAL_DIR/allow"
+  chmod 700 "$MASK_ALLOW_HOME" "$MASK_ALLOW_HOME/.config" "$MASK_ALLOW_HOME/.config/agent-guard"
+  printf '%s\n' '^GITHUB_TOKEN$' '^PORT$' >"$MASK_ALLOW_HOME/.config/agent-guard/mask-allow-keys.txt"
+  chmod 600 "$MASK_ALLOW_HOME/.config/agent-guard/mask-allow-keys.txt"
+  mask_allow_prefix=gh
+  mask_allow_prefix="${mask_allow_prefix}p_"
+  mask_allow_value="$mask_allow_prefix$(mask_real_value)$(mask_real_value | cut -c1-12)"
+  printf 'GITHUB_TOKEN=%s\nPORT=8080\n' "$mask_allow_value" >"$MASK_REAL_DIR/allow/.env"
+  printf 'PORT=8080\n' >"$MASK_REAL_DIR/allow/plain.env"
+  for mask_allow_case in token plain; do
+    case $mask_allow_case in
+      token) mask_allow_file="$MASK_REAL_DIR/allow/.env"
+        mask_allow_want=$(printf '%s\n' \
+          "agent-guard: blocked sensitive file access: $mask_allow_file" \
+          'agent-guard: the view showing the mask-allow-keys.txt values contains secret-like text or could not be scanned; every value stays masked' \
+          'agent-guard: masked view follows (values replaced with [MASKED]; the file itself was not read by the tool)' \
+          'GITHUB_TOKEN=[MASKED]' 'PORT=[MASKED]') ;;
+      plain) mask_allow_file="$MASK_REAL_DIR/allow/plain.env"
+        mask_allow_want=$(printf '%s\n' \
+          "agent-guard: blocked sensitive file access: $mask_allow_file" \
+          'agent-guard: masked view follows (values replaced with [MASKED]; the file itself was not read by the tool)' \
+          'PORT=8080') ;;
+    esac
+    jq -nc --arg p "$mask_allow_file" --arg d "$MASK_REAL_DIR/allow" \
+      '{tool_name:"Read",tool_input:{file_path:$p},cwd:$d}' \
+      | HOME="$MASK_ALLOW_HOME" AGENT_GUARD_DENY_READ_MODE=mask AGENT_GUARD_GITLEAKS_BIN="$REAL_GITLEAKS" \
+        AGENT_GUARD_HOOK_HOST=codex "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+    status=$?
+    if [ "$status" -eq 2 ] && printf '%s\n' "$mask_allow_want" | cmp -s - "$ERR" \
+       && ! grep -Fq "$mask_allow_value" "$OUT" "$ERR"; then
+      ok "real gitleaks rescans the allow-list view ($mask_allow_case)"
+    else
+      not_ok "real gitleaks rescans the allow-list view ($mask_allow_case) (status $status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+
 else
   say "real gitleaks not available; skipped real-gitleaks integration tests"
 fi
@@ -9246,6 +11172,8 @@ else
   sed 's/^/  /' "$ERR"
 fi
 
+run_expect 0 "framed leaf fast path preserves detector records and errors" sh "$ROOT/tests/framed-leaves.sh"
+run_expect 0 "redaction plan preserves ordering, context and output budgets" sh "$ROOT/tests/redaction-plan.sh"
 # --- Tool-output secret redaction (PostToolUse updatedToolOutput) ----------
 # Masks secret-like values in a tool's RESULT before the model sees it. Run from
 # a non-git dir so the mutation-tool working-tree backstop stays inert and these
@@ -9486,6 +11414,227 @@ else
   not_ok "post-tool masks a vendor-shaped value embedding a placeholder word"
   printf '%s\n' "$post_out" | sed 's/^/  out: /'
 fi
+
+# #303: an MCP page read returns `"snapshotToken": "v:<version>"` for
+# optimistic concurrency, and masking it from version 10 on made every update
+# fail as stale. That exact shape under a token key stays visible on both
+# hosts; the same key with any other shape, and the same shape under other
+# secret keys, still masks. Keys are assembled at runtime so the repository's
+# own scan does not read these fixtures as assignments.
+VREF_SECRET=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
+VREF_PW=$(printf '%s%s' pass word)
+VREF_AK=$(printf '%s%s' api _key)
+VREF_ST=$(printf '%s%s' snapshot Token)
+for vref_shown in 'v:10' 'v:123' 'v:999999999'; do
+  vref_input=$(jq -nc --arg t "{\"id\":\"1\",\"$VREF_ST\":\"$vref_shown\"}" \
+    '{tool_name:"mcp__example__readPage",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+  for vref_host in claude codex; do
+    printf '%s' "$vref_input" \
+      | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=$vref_host \
+          "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+    vref_status=$?
+    if [ "$vref_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+      ok "#303 post-tool leaves a $vref_shown version handle visible ($vref_host)"
+    else
+      not_ok "#303 post-tool leaves a $vref_shown version handle visible ($vref_host)"
+      sed 's/^/  out: /' "$OUT"
+    fi
+  done
+done
+
+vref_input=$(jq -nc --arg t "SNAPSHOT_TOKEN=v:10" \
+  '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$t,stderr:"",interrupted:false,isImage:false}}')
+post_tool_out "$vref_input"
+if [ "$?" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "#303 post-tool leaves an unquoted token-key version handle visible"
+else
+  not_ok "#303 post-tool leaves an unquoted token-key version handle visible"
+  sed 's/^/  out: /' "$OUT"
+fi
+
+vref_case=0
+for vref_text in \
+  "{\"$VREF_ST\":\"$VREF_SECRET\"}" \
+  "{\"$VREF_ST\":\"v:$VREF_SECRET\"}" \
+  "{\"$VREF_ST\":\"v:123456789012\"}" \
+  "{\"$VREF_ST\":\"v:10x\"}" \
+  "{\"${VREF_ST}_id\":\"v:10\"}" \
+  "{\"$VREF_PW\":\"v:10\"}" \
+  "$VREF_AK=v:123" \
+  "GH_TOKEN=$VREF_SECRET"; do
+  vref_case=$((vref_case + 1))
+  vref_input=$(jq -nc --arg t "$vref_text" \
+    '{tool_name:"mcp__example__readPage",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+  post_tool_out "$vref_input"
+  if grep -q '\[REDACTED\]' "$OUT" && ! grep -Fq "$VREF_SECRET" "$OUT"; then
+    ok "#303 post-tool still masks a non-handle token or other secret key (case $vref_case)"
+  else
+    not_ok "#303 post-tool still masks a non-handle token or other secret key (case $vref_case)"
+    sed 's/^/  out: /' "$OUT"
+  fi
+done
+
+vref_input=$(jq -nc \
+  --arg t "{\"$VREF_ST\":\"v:10\",\"$VREF_PW\":\"$VREF_SECRET\"}" \
+  '{tool_name:"mcp__example__readPage",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+vref_expected=$(printf '{"%s":"v:10","%s":"[%s]"}' "$VREF_ST" "$VREF_PW" REDACTED)
+post_tool_out "$vref_input"
+if jq -e --arg expected "$vref_expected" \
+     '.hookSpecificOutput.updatedToolOutput.content[0].text == $expected' \
+     "$OUT" >/dev/null 2>&1; then
+  ok "#303 post-tool keeps the version handle and masks a secret in the same response"
+else
+  not_ok "#303 post-tool keeps the version handle and masks a secret in the same response"
+  sed 's/^/  out: /' "$OUT"
+fi
+
+# A secret-bearing key with a boolean or null value is a config flag, not a
+# credential. Masking `true`/`false` also made the literal global, so the same
+# word vanished from unrelated prose in the response, and the prompt guard
+# blocked a prompt that merely described such a config. A pagination cursor
+# under a page-token key is opaque by design and has to be echoed back
+# verbatim; masking it broke every page after the first. Keys are assembled at
+# runtime so the repository's own scan does not read these as assignments.
+BOOL_AT=$(printf '%s%s' api _token)
+BOOL_PW=$(printf '%s%s' pass word)
+BOOL_NPT=$(printf '%s%s' nextPage Token)
+BOOL_SNAKE_NPT=$(printf '%s%s' next_page _token)
+BOOL_PT=$(printf '%s%s' page Token)
+BOOL_PAGE_SNAKE=$(printf '%s%s' page _token)
+BOOL_PAGE_ENV=$(printf '%s%s' PAGE _TOKEN)
+BOOL_FB_PAGE=$(printf '%s%s' FB_PAGE _TOKEN)
+BOOL_FB_CAMEL=$(printf '%s%s' fbPage Token)
+BOOL_SECRET=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+BOOL_CURSOR=$(printf 'Ci%sQAhgB' "$BOOL_SECRET")
+BOOL_GHP=$(printf '%s%s' ghp_ "$BOOL_SECRET")
+BOOL_JWT=$(printf '%s.%s.%s' eyJhbGciOiJIUzI1NiJ9 eyJzdWIiOiIxMjM0NTY3ODkwIn0 "$BOOL_SECRET")
+bool_yaml=$(printf '%s: true\nfail_open: false\npii_filter: true\n%s: false\n' \
+  "$BOOL_AT" "$BOOL_PW")
+for bool_host in claude codex; do
+  bool_input=$(jq -nc --arg t "$bool_yaml" \
+    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$t,stderr:"",interrupted:false,isImage:false}}')
+  printf '%s' "$bool_input" \
+    | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=$bool_host \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+  if [ "$?" -eq 0 ] && [ ! -s "$OUT" ]; then
+    ok "post-tool leaves boolean values under secret keys visible ($bool_host)"
+  else
+    not_ok "post-tool leaves boolean values under secret keys visible ($bool_host)"
+    sed 's/^/  out: /' "$OUT"
+  fi
+
+  bool_input=$(jq -nc --arg t "$BOOL_AT: false
+
+Likely false, because the flag is off." \
+    '{tool_name:"Agent",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+  printf '%s' "$bool_input" \
+    | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=$bool_host \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+  if [ "$?" -eq 0 ] && [ ! -s "$OUT" ]; then
+    ok "post-tool keeps a boolean word in prose next to a boolean flag ($bool_host)"
+  else
+    not_ok "post-tool keeps a boolean word in prose next to a boolean flag ($bool_host)"
+    sed 's/^/  out: /' "$OUT"
+  fi
+
+  for bool_page in "{\"issues\":[],\"$BOOL_NPT\":\"$BOOL_CURSOR\",\"isLast\":false}" \
+                   "{\"$BOOL_SNAKE_NPT\": \"$BOOL_CURSOR\"}" \
+                   "$BOOL_SNAKE_NPT: $BOOL_CURSOR" \
+                   "{\"$BOOL_PT\":\"$BOOL_CURSOR\"}" \
+                   "$BOOL_PAGE_SNAKE: $BOOL_CURSOR"; do
+    bool_input=$(jq -nc --arg t "$bool_page" \
+      '{tool_name:"mcp__example__search",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+    printf '%s' "$bool_input" \
+      | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=$bool_host \
+          "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+    if [ "$?" -eq 0 ] && [ ! -s "$OUT" ]; then
+      ok "post-tool leaves a pagination cursor visible ($bool_host)"
+    else
+      not_ok "post-tool leaves a pagination cursor visible ($bool_host)"
+      sed 's/^/  out: /' "$OUT"
+    fi
+  done
+
+  # The short-value floor counts characters: a two-character word in a
+  # multibyte script is six bytes, so it used to clear the floor and become a
+  # global literal that masked the same word across a whole document.
+  bool_input=$(jq -nc --arg t "# notes
+API token = 認証 は一つにする
+次の 認証 フローも同じ" \
+    '{tool_name:"Read",tool_input:{file_path:"/tmp/notes.md"},tool_response:{type:"text",file:{filePath:"/tmp/notes.md",content:$t}}}')
+  printf '%s' "$bool_input" \
+    | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=$bool_host \
+        "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+  if [ "$?" -eq 0 ] && [ ! -s "$OUT" ]; then
+    ok "post-tool leaves a short multibyte word after a secret key visible ($bool_host)"
+  else
+    not_ok "post-tool leaves a short multibyte word after a secret key visible ($bool_host)"
+    sed 's/^/  out: /' "$OUT"
+  fi
+
+  run_expect 0 "prompt guard allows a prompt describing boolean config keys ($bool_host)" \
+    prompt_guard_case "$bool_host" '' '' "$(jq -nc --arg p \
+      "keys like '$BOOL_AT: true' and 'fail_open: false' showed the marker; the $BOOL_NPT: [REDACTED] field too" \
+      '{prompt:$p}')"
+done
+
+if [ -n "$REAL_GITLEAKS" ]; then
+  BOOL_GL_DIR="$TESTTMP/page-cursor-gitleaks"
+  mkdir -p "$BOOL_GL_DIR"
+  bool_gl_case() { # $1 expected status, $2 label, $3 file content
+    printf '%s\n' "$3" >"$BOOL_GL_DIR/response.json"
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" "$PLUGIN_ROOT/bin/agent-guard" \
+      scan-path "$BOOL_GL_DIR" >"$OUT" 2>"$ERR"
+    bool_gl_status=$?
+    if [ "$bool_gl_status" -eq "$1" ]; then
+      ok "real gitleaks: $2"
+    else
+      not_ok "real gitleaks: $2 (expected $1, got $bool_gl_status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  }
+  bool_gl_case 0 "a pagination cursor under a page-token key is clean" \
+    "{\"$BOOL_NPT\":\"$BOOL_CURSOR\",\"isLast\":false}"
+  bool_gl_case 1 "the same value under a secret key is still found" \
+    "{\"$BOOL_AT\":\"$BOOL_CURSOR\"}"
+  bool_gl_case 1 "a vendor-shaped token under a page-token key is still found" \
+    "{\"$BOOL_NPT\":\"$(printf '%s' "$BOOL_GHP$BOOL_SECRET" | cut -c1-40)\"}"
+  bool_gl_case 1 "a page access token key is still found (env form)" \
+    "$BOOL_PAGE_ENV=$BOOL_CURSOR"
+  bool_gl_case 1 "a prefixed page access token key is still found" \
+    "{\"$BOOL_FB_PAGE\":\"$BOOL_CURSOR\"}"
+fi
+
+bool_case=0
+for bool_text in \
+  "$BOOL_AT: $BOOL_SECRET" \
+  "$BOOL_AT: trueX1$BOOL_SECRET" \
+  "$BOOL_AT: $BOOL_CURSOR" \
+  "{\"${BOOL_NPT}_id\":\"$BOOL_SECRET\"}" \
+  "$BOOL_PW: \"$BOOL_SECRET\"" \
+  "$BOOL_AT=$BOOL_GHP" \
+  "$BOOL_AT: $BOOL_JWT" \
+  "$BOOL_PW = 合言葉は$BOOL_SECRET" \
+  "$BOOL_PAGE_ENV=$BOOL_SECRET" \
+  "$BOOL_PAGE_ENV: $BOOL_SECRET" \
+  "$BOOL_FB_PAGE=$BOOL_SECRET" \
+  "{\"$BOOL_FB_PAGE\":\"$BOOL_SECRET\"}" \
+  "{\"$BOOL_FB_CAMEL\":\"$BOOL_SECRET\"}" \
+  "home$BOOL_PAGE_SNAKE: $BOOL_SECRET" \
+  "$BOOL_PAGE_SNAKE=$BOOL_SECRET"; do
+  bool_case=$((bool_case + 1))
+  bool_input=$(jq -nc --arg t "$bool_text" \
+    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$t,stderr:"",interrupted:false,isImage:false}}')
+  post_tool_out "$bool_input"
+  if grep -q '\[REDACTED\]' "$OUT" && ! grep -Fq "$BOOL_SECRET" "$OUT"; then
+    ok "post-tool still masks a real value under a secret key (case $bool_case)"
+  else
+    not_ok "post-tool still masks a real value under a secret key (case $bool_case)"
+    sed 's/^/  out: /' "$OUT"
+  fi
+  run_expect 2 "prompt guard still blocks a real value under a secret key (case $bool_case)" \
+    prompt_guard_case claude '' '' "$(jq -nc --arg p "$bool_text" '{prompt:$p}')"
+done
 
 # Display redaction replaces only the assignment value token. Text after it is
 # preserved, metadata keys with secret-ish prefixes are not values, and a prose
@@ -10046,6 +12195,8 @@ for display_case in \
   fi
 done
 
+# Pure classification variants are table-driven in unit-status-label.sh.
+# Keep five CLI representatives here; see docs/status-label-tests.md for mapping.
 # #156: a status label alone must not buy a pass. The label is identical in
 # `error: password: authentication is disabled` (prose, covered above) and in
 # `error: password: <credential>`, so the VALUE decides. These values are the
@@ -10053,70 +12204,49 @@ done
 # exactly the gap the allowlist left open: anything gitleaks recognises was
 # already masked regardless of the label.
 LABEL_SECRET=$(printf '%s%s' 'hunter2-' 'long-value')
-for display_case in \
-  "error: password: $LABEL_SECRET" \
-  "warning: db_password: $LABEL_SECRET" \
-  "WARNING: client_secret: $LABEL_SECRET" \
-  "fatal: api_key: $LABEL_SECRET" \
-  "info: refresh_token: $LABEL_SECRET" \
-  "response: error: api_key: $LABEL_SECRET" \
-  "2026-08-02 10:00:00 ERROR: password: $LABEL_SECRET"; do
-  display_input=$(jq -nc --arg stdout "$display_case" \
-    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
-  post_tool_out "$display_input"
-  post_out=$(cat "$OUT")
-  if printf '%s' "$post_out" | grep -q '\[REDACTED\]' \
-     && ! printf '%s' "$post_out" | grep -Fq "$LABEL_SECRET"; then
-    ok "#156 post-tool masks a gitleaks-invisible secret behind a status label (${display_case%%:*})"
-  else
-    not_ok "#156 post-tool masks a gitleaks-invisible secret behind a status label (${display_case%%:*})"
-    printf '%s\n' "$post_out" | sed 's/^/  out: /'
-  fi
-done
+display_case="error: password: $LABEL_SECRET"
+display_input=$(jq -nc --arg stdout "$display_case" \
+  '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
+post_tool_out "$display_input"
+post_out=$(cat "$OUT")
+if printf '%s' "$post_out" | grep -q '\[REDACTED\]' \
+   && ! printf '%s' "$post_out" | grep -Fq "$LABEL_SECRET"; then
+  ok "#156 post-tool masks a gitleaks-invisible secret behind a status label (${display_case%%:*})"
+else
+  not_ok "#156 post-tool masks a gitleaks-invisible secret behind a status label (${display_case%%:*})"
+  printf '%s\n' "$post_out" | sed 's/^/  out: /'
+fi
 
 # #156 must-not-mask companions: the value-side gate decides on SHAPE, so an
 # ordinary word, a path, a number and a timestamp after a status label all stay
 # visible. Without these the gate could be made to pass by masking everything.
-for display_case in \
-  'error: secret: not-found' \
-  'warning: private_key: /path/to/configured/key' \
-  'error: token: 2026-08-30T10:00:00' \
-  'fatal: password: 10:00:00' \
-  'warning: api_key: Missing' \
-  'info: credential: unauthenticated'; do
-  display_input=$(jq -nc --arg stdout "$display_case" \
-    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
-  post_tool_out "$display_input"
-  post_status=$?
-  if [ "$post_status" -eq 0 ] && [ ! -s "$OUT" ]; then
-    ok "#156 post-tool leaves a non-credential value after a status label untouched (${display_case##*: })"
-  else
-    not_ok "#156 post-tool leaves a non-credential value after a status label untouched (${display_case##*: })"
-    sed 's/^/  out: /' "$OUT"
-  fi
-done
+display_case='error: secret: not-found'
+display_input=$(jq -nc --arg stdout "$display_case" \
+  '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
+post_tool_out "$display_input"
+post_status=$?
+if [ "$post_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "#156 post-tool leaves a non-credential value after a status label untouched (${display_case##*: })"
+else
+  not_ok "#156 post-tool leaves a non-credential value after a status label untouched (${display_case##*: })"
+  sed 's/^/  out: /' "$OUT"
+fi
 
 # A QUOTED value is the whole message, so the class tests have to ask whether a
 # letter and a digit belong to the same token rather than whether both occur
 # somewhere in the string. Without that, an ordinary validation message behind a
 # status label was rewritten to `"[REDACTED]"`.
-for display_case in \
-  'error: password: "must be at least 8 characters"' \
-  'warning: token: "expires in 3600 seconds"' \
-  'error: api_key: "not found in profile 2"' \
-  'fatal: secret: "rotate within 90 days"' \
-  'info: credential: "Check Your Settings Page"'; do
-  display_input=$(jq -nc --arg stdout "$display_case" \
-    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
-  post_tool_out "$display_input"
-  post_status=$?
-  if [ "$post_status" -eq 0 ] && [ ! -s "$OUT" ]; then
-    ok "#156 post-tool leaves a quoted multi-word message after a status label untouched (${display_case%%:*})"
-  else
-    not_ok "#156 post-tool leaves a quoted multi-word message after a status label untouched (${display_case%%:*})"
-    sed 's/^/  out: /' "$OUT"
-  fi
-done
+display_case='error: password: "must be at least 8 characters"'
+display_input=$(jq -nc --arg stdout "$display_case" \
+  '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
+post_tool_out "$display_input"
+post_status=$?
+if [ "$post_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "#156 post-tool leaves a quoted multi-word message after a status label untouched (${display_case%%:*})"
+else
+  not_ok "#156 post-tool leaves a quoted multi-word message after a status label untouched (${display_case%%:*})"
+  sed 's/^/  out: /' "$OUT"
+fi
 
 # The date/clock exclusions must be anchored at BOTH ends. Unanchored, any value
 # merely STARTING with an ISO date escaped the gate entirely — a date-prefixed
@@ -10134,22 +12264,17 @@ else
   printf '%s\n' "$post_out" | sed 's/^/  out: /'
 fi
 
-for display_case in \
-  'error: token: 2026-08-30' \
-  'error: token: 2026-08-30T10:00:00Z' \
-  'error: token: 2026-08-30T10:00:00.123+09:00' \
-  'fatal: password: 10:00:00'; do
-  display_input=$(jq -nc --arg stdout "$display_case" \
-    '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
-  post_tool_out "$display_input"
-  post_status=$?
-  if [ "$post_status" -eq 0 ] && [ ! -s "$OUT" ]; then
-    ok "#156 post-tool leaves a complete date/clock value untouched (${display_case##*: })"
-  else
-    not_ok "#156 post-tool leaves a complete date/clock value untouched (${display_case##*: })"
-    sed 's/^/  out: /' "$OUT"
-  fi
-done
+display_case='error: token: 2026-08-30T10:00:00Z'
+display_input=$(jq -nc --arg stdout "$display_case" \
+  '{tool_name:"Bash",tool_input:{command:"x"},tool_response:{stdout:$stdout,stderr:"",interrupted:false,isImage:false}}')
+post_tool_out "$display_input"
+post_status=$?
+if [ "$post_status" -eq 0 ] && [ ! -s "$OUT" ]; then
+  ok "#156 post-tool leaves a complete date/clock value untouched (${display_case##*: })"
+else
+  not_ok "#156 post-tool leaves a complete date/clock value untouched (${display_case##*: })"
+  sed 's/^/  out: /' "$OUT"
+fi
 
 # A value that passes the shape gate is masked GLOBALLY, like one found behind
 # any other label — scoping it to the labelled line left a recurrence visible.
@@ -11526,7 +13651,7 @@ mkdir -p "$FAIL_STAGE_JQ_DIR"
   printf '%s\n' '  nul:*'\''contains("\u0000")'\''*) partial_fail ;;'
   printf '%s\n' '  restore:*'\''.[0] as $orig'\''*) partial_fail ;;'
   printf '%s\n' '  detector_leaf:*"join(\"\\n\") end"*) partial_fail ;;'
-  printf '%s\n' '  detector_frame:*"gsub(\"\\u001f\""*) partial_fail ;;'
+  printf '%s\n' '  detector_frame:*"\"\\u001e\\n\""*) partial_fail ;;'
   printf '%s\n' '  detector_report:*".Secret // empty"*) partial_fail ;;'
   printf '%s\n' '  detector_bundle:*"secrets: unique"*) partial_fail ;;'
   printf '%s\n' '  bundle_classify_true:*"invalid secret bundle"*) printf "true"; exit 2 ;;'
@@ -12390,6 +14515,9 @@ else
   sed 's/^/  stderr: /' "$ERR"
 fi
 
+run_expect 0 "PII byte windows preserve UTF-8, caller-locale emails, and failure isolation" \
+  sh "$ROOT/tests/pii-utf8.sh"
+
 # --- AGENT_GUARD_PII_SKIP (per-type Tier-1 opt-out) --------------------------
 # Tier-1 masking is output-only and never hard-blocks an input, so switching a
 # type off cannot weaken the input gate. Tier-2 names are refused outright: that
@@ -12897,6 +15025,10 @@ fi
 
 # One invalid byte can force the raw fallback. Bound secret-bearing assignment
 # dumps without hiding equally large benign binary-ish output.
+run_expect 0 "exec raw probe failures preserve fail-closed output and command status" \
+  sh "$ROOT/tests/exec-raw-probe-failure.sh"
+run_expect 0 "exec framing boundary failures preserve fail-closed output and command status" \
+  sh "$ROOT/tests/exec-framing-boundary.sh"
 "$PLUGIN_ROOT/bin/agent-guard" exec -- sh -c '
   printf "\377\n"
   awk "BEGIN { for (i = 0; i < 5000; i++) print \"PASSWORD=value-1234567890-\" i }"
@@ -13834,8 +15966,20 @@ else
   not_ok "hook-session-start silent on unparseable marker (got: $vd_out)"
 fi
 
+# NO_GITLEAKS_BIN belongs to shard 4, so build the same tool set here: these
+# probes need jq and git on PATH but no gitleaks.
+SESSION_NO_GITLEAKS_BIN="$TMP_ROOT/session-no-gitleaks-bin"
+mkdir -p "$SESSION_NO_GITLEAKS_BIN"
+for session_tool in sh dirname pwd awk sleep wc tr rm mkdir rmdir setsid perl jq git head uname; do
+  session_tool_path=$(command -v "$session_tool" 2>/dev/null || :)
+  [ -n "$session_tool_path" ] \
+    && ln -s "$session_tool_path" "$SESSION_NO_GITLEAKS_BIN/$session_tool"
+done
+codex_setup_ref="\$setup-agent-guard"
+claude_setup_ref='/agent-guard:setup-agent-guard'
+
 vd_out=$(AGENT_GUARD_HOOK_HOST=codex AGENT_GUARD_GITLEAKS_BIN=/nonexistent/gitleaks \
-  PATH="$NO_GITLEAKS_BIN" "$PLUGIN_ROOT/bin/agent-guard" hook-session-start 2>"$ERR")
+  PATH="$SESSION_NO_GITLEAKS_BIN" "$PLUGIN_ROOT/bin/agent-guard" hook-session-start 2>"$ERR")
 if [ $? -eq 0 ] \
    && printf '%s' "$vd_out" | jq -e \
         --arg expected "$codex_setup_ref" \
@@ -13848,7 +15992,7 @@ else
 fi
 
 vd_out=$(AGENT_GUARD_HOOK_HOST=claude AGENT_GUARD_GITLEAKS_BIN=/nonexistent/gitleaks \
-  PATH="$NO_GITLEAKS_BIN" "$PLUGIN_ROOT/bin/agent-guard" hook-session-start 2>"$ERR")
+  PATH="$SESSION_NO_GITLEAKS_BIN" "$PLUGIN_ROOT/bin/agent-guard" hook-session-start 2>"$ERR")
 if [ $? -eq 0 ] \
    && printf '%s' "$vd_out" | jq -e \
         --arg expected "$claude_setup_ref" \
@@ -14123,12 +16267,17 @@ else
 fi
 # The notice must say fish itself gets no agx/nudge — claiming otherwise would
 # misreport what is protected — while staying host-neutral like the rest of the CLI.
-if printf '%s' "$ss_fish_out" | grep -q 'fish' \
+# Substitute only literal fixture paths: a checkout named Codex is not host prose.
+ss_fish_notice=$(printf '%s' "$ss_fish_out" | jq -Rrs \
+  --arg home "$ss_fish_home" --arg executable "$PLUGIN_ROOT/bin/agent-guard" \
+  'split($home) | join("<fixture-home>") | split($executable) | join("<fixture-executable>")')
+if [ -n "$ss_fish_notice" ] \
+   && printf '%s' "$ss_fish_out" | grep -q 'fish' \
    && printf '%s' "$ss_fish_out" | grep -q 'agx' \
    && printf '%s' "$ss_fish_out" | grep -q 'plugin-only' \
    && printf '%s' "$ss_fish_out" | grep -q 'fish executable:' \
    && grep -Fq 'current/bin/agent-guard' "$ROOT/docs/operations.md" \
-   && ! printf '%s' "$ss_fish_out" | grep -Eq 'Claude Code|Codex'; then
+   && ! printf '%s' "$ss_fish_notice" | grep -Eq 'Claude Code|Codex'; then
   ok "setup-shell reports the fish limitation and plugin-only executable (#139)"
 else
   not_ok "setup-shell fish limitation/plugin-only guidance (got: $ss_fish_out)"
@@ -14723,6 +16872,8 @@ else
   not_ok "structured Write normal target is not a control-character false positive (expected 0, got $status)"
   sed 's/^/  stderr: /' "$ERR"
 fi
+
+fi # end of shard 4
 
 say "passed: $pass"
 say "failed: $fail"

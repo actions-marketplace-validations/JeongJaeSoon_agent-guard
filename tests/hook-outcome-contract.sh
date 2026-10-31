@@ -135,6 +135,233 @@ for host in claude codex; do
   else
     not_ok "$host manifest path applies closed infrastructure policy (status $status)"
   fi
+
+  # The open warning is once per session; a closed block is not. The second
+  # unresolvable command in a session must still say why it was denied.
+  for attempt in first second; do
+    run_manifest "$host" closed "$MOCK_GITLEAKS" \
+      '{"session_id":"outcome-repeat","tool_name":"Bash","tool_input":{"command":"V=/tmp/x/tool.sh; bash $V doctor"}}'
+    status=$?
+    if [ "$status" -eq 2 ] && grep -Fq 'could not be resolved safely' "$CASE_ROOT/err"; then
+      ok "$host manifest path explains the $attempt closed block in a session"
+    else
+      not_ok "$host manifest path explains the $attempt closed block in a session (status $status)"
+    fi
+  done
+
+  # Compound commands an agent sends while inspecting several worktrees. Each
+  # closed block must carry its reason, however many came before it.
+  for shell_cmd in \
+    'for p in a b; do d=/tmp/x/$p; b=$(git -C $d branch --show-current 2>/dev/null); pr=$(cd $d && gh pr list --head "$b" --json number --jq "map(.number)|join(\",\")"); echo "$p $b $pr"; done' \
+    "cut -d' ' -f1 /tmp/x/list | grep -v x | xargs bash /tmp/x/run.sh > /tmp/x/out 2>&1; grep -v -E 'a|b' /tmp/x/out | cut -c1-140"; do
+    for attempt in first second; do
+      run_manifest "$host" closed "$MOCK_GITLEAKS" \
+        "$(jq -nc --arg c "$shell_cmd" '{session_id:"outcome-compound",tool_name:"Bash",tool_input:{command:$c}}')"
+      status=$?
+      if [ "$status" -eq 2 ] && grep -Fq 'could not be resolved safely' "$CASE_ROOT/err"; then
+        ok "$host manifest path explains the $attempt closed block of compound ${shell_cmd%%[ ;]*}"
+      else
+        not_ok "$host manifest path explains the $attempt closed block of compound ${shell_cmd%%[ ;]*} (status $status)"
+      fi
+    done
+  done
+
+  # A warning marker that cannot be written (full disk, read-only dir) is not
+  # proof this session already warned.
+  if [ "$(id -u)" -ne 0 ]; then
+    readonly_dir="$CASE_ROOT/readonly-warnings-$host"
+    mkdir -p "$readonly_dir"
+    chmod 0500 "$readonly_dir"
+    for attempt in first second; do
+      AGENT_GUARD_WARNING_DIR="$readonly_dir" AGENT_GUARD_HOOK_HOST="$host" \
+        AGENT_GUARD_INFRA_FAILURE_MODE=open \
+        AGENT_GUARD_GITLEAKS_BIN="$CASE_ROOT/no-gitleaks" "$GUARD" hook-pre-tool \
+        >"$CASE_ROOT/out" 2>"$CASE_ROOT/err" <<'JSON'
+{"session_id":"outcome-readonly","tool_name":"Bash","tool_input":{"command":"printf clean"}}
+JSON
+      status=$?
+      if [ "$status" -eq 0 ] && grep -Fq 'AGENT_GUARD_INFRA_FAILURE_MODE=open' "$CASE_ROOT/err"; then
+        ok "$host open warning survives an unwritable marker ($attempt)"
+      else
+        not_ok "$host open warning survives an unwritable marker ($attempt, status $status)"
+      fi
+    done
+
+    # Several scans failing in one run must still leave one JSON object on
+    # stdout: Claude's PreToolUse onFailure "block" treats unparseable output
+    # as a failure and would block an open-mode allow.
+    failing_scanner="$CASE_ROOT/failing-gitleaks"
+    printf '#!/bin/sh\n[ "${1:-}" = version ] && exec "%s" "$@"\nexit 3\n' \
+      "$MOCK_GITLEAKS" >"$failing_scanner"
+    chmod +x "$failing_scanner"
+    repo="$CASE_ROOT/multi-failure-repo-$host"
+    git init -q "$repo"
+    printf 'x\n' >"$repo/a.txt"
+    git -C "$repo" add a.txt
+    (cd "$repo" && AGENT_GUARD_WARNING_DIR="$readonly_dir" AGENT_GUARD_HOOK_HOST="$host" \
+      AGENT_GUARD_INFRA_FAILURE_MODE=open \
+      AGENT_GUARD_GITLEAKS_BIN="$failing_scanner" "$GUARD" hook-pre-tool \
+      >"$CASE_ROOT/out" 2>"$CASE_ROOT/err") <<JSON
+{"session_id":"outcome-multi","cwd":"$repo","tool_name":"Bash","tool_input":{"command":"git commit -m x"}}
+JSON
+    status=$?
+    warnings=$(grep -c 'AGENT_GUARD_INFRA_FAILURE_MODE=open' "$CASE_ROOT/err")
+    objects=$(jq -s length "$CASE_ROOT/out" 2>/dev/null) || objects=invalid
+    if [ "$status" -eq 0 ] && [ "$warnings" -ge 2 ] && [ "$objects" = 1 ]; then
+      ok "$host open mode writes one JSON object when several scans fail"
+    else
+      not_ok "$host open mode writes one JSON object when several scans fail (status $status, warnings $warnings, objects $objects)"
+    fi
+    chmod 0700 "$readonly_dir"
+  fi
+
+  # Shell structure that runs no git command needs no unresolvable verdict:
+  # a case subject, a heredoc with conflict markers, awk's $0.
+  for shell_cmd in \
+    'for n in 1 2; do st=$(printf %s "$n"); case $st in 1|2) ;; *) break;; esac; done' \
+    "$(printf 'python3 - <<%s\nprint(%s)\nPY' "'PY'" '"<<<<<<< HEAD"')" \
+    "awk '{print \$0}' /tmp/x/a.txt"; do
+    run_manifest "$host" closed "$MOCK_GITLEAKS" \
+      "$(jq -nc --arg c "$shell_cmd" '{session_id:"outcome-shell",tool_name:"Bash",tool_input:{command:$c}}')"
+    status=$?
+    if [ "$status" -eq 0 ] && [ ! -s "$CASE_ROOT/err" ]; then
+      ok "$host manifest path allows shell structure without git: ${shell_cmd%%[ ;]*}"
+    else
+      not_ok "$host manifest path allows shell structure without git: ${shell_cmd%%[ ;]*} (status $status)"
+    fi
+  done
+
+  # Commands an agent runs that commit or push nothing: text behind a quoted
+  # here-document delimiter that only cat, tee or python reads, and a git
+  # argument held in a variable set to one plain word.
+  for shell_cmd in \
+    "$(printf 'cat > /tmp/x/plan.md <<%s\n| step | `tool land` or $(tool merge) |\ngit push origin main\nEOF' "'EOF'")" \
+    "$(printf 'python3 - <<%s\nprint("`x` $(y) git push")\nPY' "'PY'")" \
+    "$(printf 'cat > /tmp/x/brief.md <<%s\nSigned commits, push (no force). Measure it first (`tool status`, `tool --version`).\nEOF\ncp /tmp/x/a.png /tmp/x/b.png\nmytool create --prompt "signed commits, push (no force)"' "'EOF'")" \
+    "$(printf 'tee /tmp/x/n.md <<\\EOF >/dev/null\n`x`\nEOF')" \
+    'R=/tmp/x/r; git -C $R rev-parse --abbrev-ref HEAD; git -C $R branch --show-current' \
+    'p=/tmp/x/r; echo "$p: $(git -C $p branch --show-current) $(git -C $p status --porcelain | wc -l)"' \
+    "$(printf 'cd /tmp/x && cp a b && \\\nsed -i "" s/a/b/ b')" \
+    'echo $(date) $(date +%s)' \
+    't=$(( $(date +%s) - 5 )); [ $t -gt 0 ] && sleep $t' \
+    "$(printf 'cat > /tmp/x/b.md <<EOF\nHead $S at ${B}\nEOF')" \
+    'G=~/.local/bin/gh; $G pr edit 1 --body-file /tmp/x/b.md' \
+    'G=$HOME/.local/bin/gh; $G api user' \
+    "$(printf 'cat > /tmp/x/b.md <<%s\nRan `npm test`\nEOF\n/opt/homebrew/bin/gh pr edit 1 --body-file /tmp/x/b.md && /opt/homebrew/bin/gh pr view 1' "'EOF'")" \
+    "$(printf 'cat > /tmp/x/b.md <<%s\nRan `npm test`\nEOF\nbash /tmp/x/post.sh /tmp/x/b.md' "'EOF'")" \
+    "$(printf 'gh pr create --title t --body-file - <<EOF\nBody for $S\nEOF')"; do
+    run_manifest "$host" closed "$MOCK_GITLEAKS" \
+      "$(jq -nc --arg c "$shell_cmd" '{session_id:"outcome-no-git-write",tool_name:"Bash",tool_input:{command:$c}}')"
+    status=$?
+    if [ "$status" -eq 0 ] && [ ! -s "$CASE_ROOT/err" ]; then
+      ok "$host manifest path allows a command that commits nothing: ${shell_cmd%%[ ;]*}"
+    else
+      not_ok "$host manifest path allows a command that commits nothing: ${shell_cmd%%[ ;]*} (status $status)"
+    fi
+  done
+
+  # The same text a shell may read, or this shell expands, stays code; so
+  # does a variable that may split or join other words.
+  for shell_cmd in \
+    "$(printf 'cat <<%s | bash\n$(echo git) push\nEOF' "'EOF'")" \
+    "$(printf 'cat > >(bash) <<%s\n$(echo git) push\nEOF' "'EOF'")" \
+    "$(printf 'cat <<%s \\\n| bash\n$(echo git) push\nEOF' "'EOF'")" \
+    "$(printf 'bash <<%s\n`echo git` push\nEOF' "'EOF'")" \
+    "R='/tmp/x push'; git -C \$R" \
+    'R=push; git -C /tmp/x $R{,}' \
+    "R=/tmp/x; sh -c 'git -C \$R push'" \
+    "R=/tmp/x; git -c alias.z='!git -C \$R push' z"; do
+    run_manifest "$host" closed "$MOCK_GITLEAKS" \
+      "$(jq -nc --arg c "$shell_cmd" '{session_id:"outcome-still-code",tool_name:"Bash",tool_input:{command:$c}}')"
+    status=$?
+    if [ "$status" -eq 2 ] && grep -Fq 'could not be resolved safely' "$CASE_ROOT/err"; then
+      ok "$host manifest path keeps code that may push unresolved: ${shell_cmd%%[ ;]*}"
+    else
+      not_ok "$host manifest path keeps code that may push unresolved: ${shell_cmd%%[ ;]*} (status $status)"
+    fi
+  done
+  # A closed block names the part it could not resolve and what to run
+  # instead.
+  for case_line in \
+    'cd "$D" && git push	a cd goes to a directory only known at run time' \
+    'git clone -q /tmp/x/a /tmp/x/b && cd /tmp/x/b && git commit -m x	a cd runs after git `clone`' \
+    'gh repo clone o/r /tmp/x/c; cd /tmp/x/c && git push	a cd runs after `gh`' \
+    'G=~/bin/git; $G push	the command name `$G` is only known at run time' \
+    'for p in a b; do git -C $p push; done	so quote it'; do
+    shell_cmd=${case_line%%"	"*}
+    reason=${case_line#*"	"}
+    run_manifest "$host" closed "$MOCK_GITLEAKS" \
+      "$(jq -nc --arg c "$shell_cmd" '{session_id:"outcome-reason",tool_name:"Bash",tool_input:{command:$c}}')"
+    status=$?
+    if [ "$status" -eq 2 ] && grep -Fq "$reason" "$CASE_ROOT/err" \
+       && grep -Fq 'run that git command as its own Bash call' "$CASE_ROOT/err"; then
+      ok "$host closed block names why: $reason"
+    else
+      not_ok "$host closed block names why: $reason (status $status)"
+    fi
+  done
+
+  # A body the same line may run as a script is still read for a push, and
+  # so is a substitution the shell expands in a here-document, an
+  # arithmetic expansion or a continued line.
+  for shell_cmd in \
+    "$(printf 'cat >/dev/null <<EOF\n$(git push)\nEOF')" \
+    "$(printf 'cat <<EOF\n%s\n$(git push)\nEOF' "x it's")" \
+    "$(printf 'cat <<EOF\n# $(git push)\nEOF')" \
+    "$(printf 'cat <<EOF\n`git push`\nEOF')" \
+    'echo $((git push) )' \
+    'echo $(( $(git push) + 1 ))' \
+    "$(printf 'echo a && \\\ngit push')" \
+    "$(printf 'gi\\\nt push')" \
+    "$(printf 'cat > s <<%s\ngit push\nEOF\nchmod +x s; ./s' "'EOF'")" \
+    "$(printf 'cat > /tmp/x/s.sh <<%s\ngit push\nEOF\nbash /tmp/x/s.sh' "'EOF'")" \
+    "$(printf 'cat > /tmp/x/s.sh <<%s\ngit push\nEOF\nchmod +x /tmp/x/s.sh; /tmp/x/s.sh' "'EOF'")" \
+    "$(printf 'mkfifo /tmp/x/p; bash /tmp/x/p &\ncat > /tmp/x/p <<%s\ngit push\nEOF' "'EOF'")" \
+    "$(printf 'cat > s.sh <<EOF\necho $(date)\ngit push\nEOF\nsh s.sh')" \
+    "$(printf 'cat > s.sh <<%s\ngit push\nEOF\nsh S.SH' "'EOF'")" \
+    "$(printf 'cat > s.sh <<%s\ngit push\nEOF\nsh s.*' "'EOF'")" \
+    "$(printf 'cat > /tmp/x/run.sh <<%s\ngit push\nEOF\n/tmp/x/r?n.sh' "'EOF'")" \
+    "$(printf 'gh alias set --shell p - <<%s\ngit push\nEOF\ngh p' "'EOF'")" \
+    "echo 'a>' & git push" \
+    'echo a\> & git push'; do
+    run_manifest "$host" closed "$MOCK_GITLEAKS" \
+      "$(jq -nc --arg c "$shell_cmd" '{session_id:"outcome-script",tool_name:"Bash",tool_input:{command:$c}}')"
+    status=$?
+    if [ "$status" -eq 2 ]; then
+      ok "$host manifest path reads a here-document the line runs: ${shell_cmd%%[ ;]*}"
+    else
+      not_ok "$host manifest path reads a here-document the line runs: ${shell_cmd%%[ ;]*} (status $status)"
+    fi
+  done
+
+  # Subjects are expanded before matching. Do not execute these inputs: the
+  # synthetic hook must classify re-evaluating forms as unresolved in closed
+  # mode even without a lexical command substitution in the subject itself.
+  for shell_cmd in \
+    "g=git; X='\$(eval \"\$g commit -m x\")'; case \"\${X@P}\" in *) :;; esac" \
+    'case "${X@P}" in *) :;; esac' \
+    'case "${a[index]}" in *) :;; esac' \
+    'case "$[index]" in *) :;; esac' \
+    'case "$a[index]" in *) :;; esac'; do
+    run_manifest "$host" closed "$MOCK_GITLEAKS" \
+      "$(jq -nc --arg c "$shell_cmd" '{session_id:"outcome-case-expansion",tool_name:"Bash",tool_input:{command:$c}}')"
+    status=$?
+    if [ "$status" -eq 2 ] && grep -Fq 'could not be resolved safely' "$CASE_ROOT/err"; then
+      ok "$host manifest path keeps executable case expansion unresolved"
+    else
+      not_ok "$host manifest path keeps executable case expansion unresolved (status $status)"
+    fi
+  done
+
+  # A dotenv operand behind a variable stays a text-match deny.
+  run_manifest "$host" closed "$MOCK_GITLEAKS" \
+    '{"session_id":"outcome-shell","tool_name":"Bash","tool_input":{"command":"f=.env.local; cat $f"}}'
+  status=$?
+  if [ "$status" -eq 2 ] && grep -Fq 'agent-guard: blocked' "$CASE_ROOT/err"; then
+    ok "$host manifest path keeps a dotenv operand behind a variable denied"
+  else
+    not_ok "$host manifest path keeps a dotenv operand behind a variable denied (status $status)"
+  fi
 done
 
 printf '%s hook outcome contract checks, %s failed\n' "$checked" "$failed"

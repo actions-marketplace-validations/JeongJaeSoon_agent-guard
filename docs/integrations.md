@@ -11,6 +11,13 @@ repository does not prove that your installed copy dispatches it or that the
 host accepts the replacement; run the live probes in
 [Verification](verification.md).
 
+To wire the hooks without installing a plugin, start from the manifests in
+[`examples/claude/settings.project.json`](https://github.com/JeongJaeSoon/agent-guard/blob/main/examples/claude/settings.project.json)
+and
+[`examples/codex/hooks.json`](https://github.com/JeongJaeSoon/agent-guard/blob/main/examples/codex/hooks.json),
+and point each hook command at `plugins/agent-guard/bin/agent-guard` in your
+checkout. They are rendered from the same source as the plugin manifests.
+
 ## Claude Code
 
 The plugin hooks inspect supported reads, writes, shell commands, web/MCP input,
@@ -32,6 +39,9 @@ target, so it does not receive the direct named-file scan used by structured
 write tools.
 
 Codex does not promise interception of arbitrary `Read`, `Grep`, or web tools.
+With `AGENT_GUARD_DENY_READ_MODE=mask`, a Codex shell command that is exactly
+`cat PATH` for a protected file gets the same masked view in its block reason as
+a Claude `Read` (see [configuration](configuration.md#masked-view-on-a-blocked-read)).
 Its hooks also run only after their current definitions have been reviewed and
 trusted. Official documentation covers plugin-hook trust and `PLUGIN_ROOT`:
 [Codex Hooks](https://learn.chatgpt.com/docs/hooks). Test the exact tool route;
@@ -86,15 +96,16 @@ jobs:
 ```
 
 `@v3` is a moving major-version tag and receives compatible updates. For a
-managed rollout, replace it with the exact reviewed release tag, such as
-`@v3.4.1`, and advance that pin through a reviewed pull request. A commit SHA
+managed rollout, replace it with the exact release tag you reviewed, written as
+`@vX.Y.Z`, and advance that pin through a reviewed pull request. A commit SHA
 provides an even tighter immutable pin when your organization requires it.
 
 The shown checksum is for gitleaks 8.30.1 on `linux/x64`; refresh the version
 and checksum together when changing either one. Generate a matching value with
 `agent-guard checksum`. `require-checksum` is `true` by default. Set it to
 `false` only for local experimentation. `paths` is whitespace separated, so an
-individual path cannot contain spaces.
+individual path cannot contain spaces. `config-path` points the scan at your own
+gitleaks config instead of the bundled one.
 
 ## Limits and backstops
 
@@ -119,6 +130,20 @@ individual path cannot contain spaces.
   host-valid sanitized output. It reports the disk finding on stderr and marks
   the audit outcome `blocked`. A disk finding with no output rewrite still exits
   with status 2.
+- A blocking Claude `PreToolUse`, `UserPromptSubmit` or `Stop` hook exits 2
+  with the reason on stderr. On Claude Code 2.1.214 or newer, read from the
+  `AI_AGENT` variable Claude Code exports, it also prints that reason as JSON.
+  Claude Code then shows the reason without the hook command and leaves a
+  blocked prompt out of the block message. Older or unrecognized versions get
+  stderr only: before 2.1.214, an exit-2 hook whose JSON failed validation
+  could stop blocking. Claude Code still lists the hook command in the ctrl+o
+  view of a `Stop` hook, passes it to the model with a `Stop` block, and keeps
+  blocked prompts in its local prompt history.
+- A masked view of a protected file travels in that same block reason, so
+  every host gets it from the same stderr and Claude Code 2.1.214+ also as
+  JSON. Agent Guard does not swap a tool's output after the read instead: that
+  path lets the original output through on an error, and the file has already
+  been read by then.
 - Shell blocking is pattern-based. It can block benign path-shaped text and an
   actively evasive command can avoid a fixed pattern list.
 - A user-typed host shell escape is outside the tool-hook boundary. Do not print
@@ -155,9 +180,8 @@ What masking cannot do on either host:
 
 - Undo the tool effect. Files, commands, and network requests already happened
   when `PostToolUse` runs; masking is a model-input boundary, not a rollback.
-- Survive a timeout. A hook killed at the host budget produces no replacement,
-  and a timed-out Claude `PreToolUse` does not block the call. Keep the Git
-  hook and CI backstops.
+- Survive a timeout. A hook killed at the host budget produces no replacement.
+  Keep the Git hook and CI backstops.
 - Force acceptance. If a Claude built-in replacement does not match the tool's
   output schema, the host may keep the original. Agent Guard preserves the
   original JSON shape whenever it can; the last-resort fixed `[REDACTED]` string
@@ -167,7 +191,7 @@ Hook timeouts in every shipped manifest:
 
 | Event | Timeout |
 | --- | --- |
-| `PreToolUse` | 10 s |
+| `PreToolUse` | 60 s |
 | `PostToolUse` | 20 s |
 | `Stop` | 20 s |
 | `SessionStart` | 5 s |
@@ -176,3 +200,16 @@ Hook timeouts in every shipped manifest:
 `AGENT_GUARD_INFRA_FAILURE_MODE=closed` applies when Agent Guard itself can
 decide and return exit status 2 in time. A non-empty payload that is not a JSON
 object is rejected regardless of that mode; empty stdin passes with status 0.
+
+A Claude `PreToolUse` hook that the host kills at its timeout, cannot start,
+exits with a status other than 0 or 2, or prints stdout that is not one valid
+JSON object, blocks the tool call: the
+Claude manifests set `"onFailure": "block"` on that hook, whatever
+`AGENT_GUARD_INFRA_FAILURE_MODE` says. The infrastructure mode covers failures
+Agent Guard detects and reports itself; a hook that never returns cannot apply
+it. The 60 s budget leaves room for slow but legitimate checks, such as a long
+inline script on a loaded machine. Claude Code before 2.1.295 ignores
+`onFailure` and lets a timed-out `PreToolUse` hook through, and the Codex
+manifests do not set it. Other events keep the host default: a timed-out
+`UserPromptSubmit`, `PostToolUse`, `Stop`, or `SessionStart` hook does not
+block.

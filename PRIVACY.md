@@ -51,7 +51,12 @@ once at invocation start, examines at most 2,000 top-level entries, and only
 removes generated event names. Concurrent runs or externally populated storage
 can exceed that target; cleanup remains bounded. No cleanup runs
 on the signal/exit path. Logging is best-effort and never changes a guard decision.
-Set `AGENT_GUARD_LOG_MODE=off` to opt out. `agent-guard logs status` reports
+The same directory holds `gitleaks-probe`, which records the resolved gitleaks
+path, its file identity and version after a successful readiness check, so later
+invocations within ten minutes can skip rerunning `gitleaks version`. Every
+invocation still runs its own scan.
+Set `AGENT_GUARD_LOG_MODE=off` to opt out; the readiness check then runs in
+every invocation. `agent-guard logs status` reports
 local log state and `agent-guard logs export` writes the safe metadata JSONL to
 standard output. Neither command exports inspected content, file paths,
 environment values, host session identifiers, or arbitrary tool names.
@@ -71,6 +76,15 @@ The following explicit actions use the network:
   tool content.
 - The standalone `bootstrap.sh` install path downloads Agent Guard's release
   archive and checksum from this project's GitHub Releases page.
+  `agent-guard update` first downloads that `bootstrap.sh` from the latest
+  release.
+- `agent-guard doctor`, `agent-guard plugin status`, and `agent-guard plugin
+  update` can send one `HEAD` request to this project's GitHub
+  `releases/latest` URL to learn the newest version. It sends no project or
+  tool content. Set `AGENT_GUARD_RELEASE_CHECK=off` to skip it.
+- `agent-guard plugin install` and `agent-guard plugin update` run the Claude
+  Code or Codex plugin manager, which fetches this project's marketplace from
+  GitHub.
 - If the user selects the experimental `AGENT_GUARD_PII_PROVIDER=http` adapter
   or the `AGENT_GUARD_PII_PROVIDER=pleno` adapter, `agent-guard pii-filter`
   sends the complete text provided on stdin to the exact URL in

@@ -2,7 +2,8 @@
 # Render every committed hook manifest from ONE set of tables.
 #
 # Every event's matcher, timeout, and hook subcommand must agree across all four
-# manifests; only the command string legitimately differs. Editing them by hand
+# manifests; only the command string and the Claude-only PreToolUse onFailure
+# key legitimately differ. Editing them by hand
 # meant twenty copies kept in lockstep, so this script is the single source of
 # truth: edit the tables below, run it, and commit the result.
 #
@@ -33,7 +34,7 @@ CLAUDE_POST_MATCHER='^(Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell|apply_p
 # @ROOT_VAR@ = plugin-root env var the host exports, @HOST@ = hook-contract
 # host tag, @SUB@ = agent-guard hook subcommand for the event.
 PLUGIN_TEMPLATE=$(cat <<'EOF'
-sh -c 'r=${@ROOT_VAR@:-}; b=${r%/*}; x=; semver() { case ${1:-} in ""|*[!0-9.]*) return 1 ;; esac; o=$IFS; IFS=.; set -- $1; IFS=$o; [ "$#" -eq 3 ] && [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ]; }; root_ok() { q=$1; e=${2:-}; z="$q/bin/agent-guard"; [ -x "$z" ] && [ -r "$q/config/gitleaks.toml" ] && [ -r "$q/config/deny-read-paths.txt" ] && [ -r "$q/config/deny-bash-patterns.txt" ] || return 1; u=; while IFS= read -r l; do case "$l" in VERSION=*) u=${l#VERSION=}; break ;; esac; done <"$z"; [ -n "$u" ] && { [ -z "$e" ] || [ "$u" = "$e" ]; }; }; if [ -n "$r" ]; then v=${r##*/}; semver "$v" || v=; if root_ok "$r" "$v"; then x="$r/bin/agent-guard"; elif [ ! -e "$r" ]; then c="$b/current"; t=; [ -L "$c" ] && t=$(readlink "$c" 2>/dev/null) || :; if semver "$t" && root_ok "$c" "$t"; then x="$c/bin/agent-guard"; else x=$(for z in "$b"/*/bin/agent-guard; do [ -x "$z" ] || continue; q=${z%/bin/agent-guard}; v=${q##*/}; semver "$v" || continue; root_ok "$q" "$v" || continue; printf "%s\\t%s\\n" "$v" "$z"; done | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | cut -f 2-); fi; fi; fi; if [ ! -x "$x" ]; then mode=${AGENT_GUARD_INFRA_FAILURE_MODE:-open}; case "$mode" in closed) action=blocking ;; *) mode=open; action=continuing ;; esac; d=${AGENT_GUARD_WARNING_DIR:-${TMPDIR:-/tmp}/agent-guard-warnings-${UID:-user}}; p=; while IFS= read -r line || [ -n "$line" ]; do p=$p$line; done; i=${AGENT_GUARD_SESSION_ID:-}; if [ -z "$i" ] && command -v jq >/dev/null 2>&1; then i=$(printf %s "$p" | jq -r ".session_id // empty" 2>/dev/null); fi; if [ -z "$i" ]; then case "$p" in *\"session_id\":\"*) i=${p#*\"session_id\":\"}; i=${i%%\"*}; case "$i" in ""|*[!A-Za-z0-9._:-]*) i= ;; esac ;; esac; fi; if [ -n "$i" ]; then i=$(printf %s "$i" | cksum); else i=ppid-${PPID:-0}; fi; k="$d/manifest-@HOST@-$i-$mode"; warn=1; if mkdir -p "$d" 2>/dev/null; then (umask 077; set -C; : >"$k") 2>/dev/null || warn=0; fi; [ "$warn" -eq 0 ] || echo "agent-guard: @ROOT_VAR@ env not set, selected root was incomplete, or no installed binary was found; $action because AGENT_GUARD_INFRA_FAILURE_MODE=$mode" >&2; [ "$mode" = closed ] && exit 2; exit 0; fi; AGENT_GUARD_HOOK_HOST=@HOST@ "$x" @SUB@'
+sh -c 'r=${@ROOT_VAR@:-}; b=${r%/*}; x=; semver() { case ${1:-} in ""|*[!0-9.]*) return 1 ;; esac; o=$IFS; IFS=.; set -- $1; IFS=$o; [ "$#" -eq 3 ] && [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ]; }; root_ok() { q=$1; e=${2:-}; z="$q/bin/agent-guard"; [ -x "$z" ] && [ -r "$q/config/gitleaks.toml" ] && [ -r "$q/config/deny-read-paths.txt" ] && [ -r "$q/config/deny-bash-patterns.txt" ] || return 1; u=; while IFS= read -r l; do case "$l" in VERSION=*) u=${l#VERSION=}; break ;; esac; done <"$z"; [ -n "$u" ] && { [ -z "$e" ] || [ "$u" = "$e" ]; }; }; if [ -n "$r" ]; then v=${r##*/}; semver "$v" || v=; if root_ok "$r" "$v"; then x="$r/bin/agent-guard"; elif [ ! -e "$r" ]; then c="$b/current"; t=; [ -L "$c" ] && t=$(readlink "$c" 2>/dev/null) || :; if semver "$t" && root_ok "$c" "$t"; then x="$c/bin/agent-guard"; else x=$(for z in "$b"/*/bin/agent-guard; do [ -x "$z" ] || continue; q=${z%/bin/agent-guard}; v=${q##*/}; semver "$v" || continue; root_ok "$q" "$v" || continue; printf "%s\\t%s\\n" "$v" "$z"; done | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | cut -f 2-); fi; fi; fi; if [ ! -x "$x" ]; then mode=${AGENT_GUARD_INFRA_FAILURE_MODE:-open}; case "$mode" in closed) action=blocking ;; *) mode=open; action=continuing ;; esac; d=${AGENT_GUARD_WARNING_DIR:-${TMPDIR:-/tmp}/agent-guard-warnings-${UID:-user}}; p=; while IFS= read -r line || [ -n "$line" ]; do p=$p$line; done; i=${AGENT_GUARD_SESSION_ID:-}; if [ -z "$i" ] && command -v jq >/dev/null 2>&1; then i=$(printf %s "$p" | jq -r ".session_id // empty" 2>/dev/null); fi; if [ -z "$i" ]; then case "$p" in *\"session_id\":\"*) i=${p#*\"session_id\":\"}; i=${i%%\"*}; case "$i" in ""|*[!A-Za-z0-9._:-]*) i= ;; esac ;; esac; fi; if [ -n "$i" ]; then i=$(printf %s "$i" | cksum); else i=ppid-${PPID:-0}; fi; k="$d/manifest-@HOST@-$i-$mode"; warn=1; if [ "$mode" = open ] && mkdir -p "$d" 2>/dev/null; then (umask 077; set -C; : >"$k") 2>/dev/null || { [ -e "$k" ] && warn=0; }; fi; [ "$warn" -eq 0 ] || echo "agent-guard: @ROOT_VAR@ env not set, selected root was incomplete, or no installed binary was found; $action because AGENT_GUARD_INFRA_FAILURE_MODE=$mode" >&2; [ "$mode" = closed ] && exit 2; exit 0; fi; AGENT_GUARD_HOOK_HOST=@HOST@ "$x" @SUB@'
 EOF
 )
 
@@ -68,6 +69,14 @@ render_command() { # $1 = root env var, $2 = host tag, $3 = hook subcommand, $4 
 }
 
 render_manifest() { # $1 = root env var, $2 = host tag, $3/$4 = pre/post matcher, $5 = style
+  # Claude lets a PreToolUse hook that times out, crashes, exits other than
+  # 0/2, or prints invalid JSON through unchecked unless onFailure is "block"
+  # (Claude Code 2.1.295+).
+  # Codex has no such key, so its manifests leave it out.
+  case "$2" in
+    claude) pre_on_failure=block ;;
+    *) pre_on_failure= ;;
+  esac
   # Status-checked assignments: a render_command failure inside a jq argument's
   # command substitution would otherwise be discarded while jq still exits 0.
   pre=$(render_command "$1" "$2" hook-pre-tool "$5") || return 1
@@ -79,13 +88,16 @@ render_manifest() { # $1 = root env var, $2 = host tag, $3/$4 = pre/post matcher
     --arg pre_matcher "$3" \
     --arg post_matcher "$4" \
     --arg pre "$pre" \
+    --arg pre_on_failure "$pre_on_failure" \
     --arg post "$post" \
     --arg stop "$stop" \
     --arg session "$session" \
     --arg prompt "$prompt" \
     '{hooks: {
        PreToolUse: [{matcher: $pre_matcher,
-                     hooks: [{type: "command", command: $pre, timeout: 10}]}],
+                     hooks: [{type: "command", command: $pre, timeout: 60}
+                             + (if $pre_on_failure == "" then {}
+                                else {onFailure: $pre_on_failure} end)]}],
        PostToolUse: [{matcher: $post_matcher,
                       hooks: [{type: "command", command: $post, timeout: 20}]}],
        Stop: [{matcher: "",

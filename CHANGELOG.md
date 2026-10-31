@@ -1,3 +1,153 @@
+## v3.6.11 - 2026-10-30
+
+- fix(hooks): resolve commit and push in compound Bash commands (#367)
+
+## v3.6.10 - 2026-10-30
+
+- fix(prompt-guard): make blocked injected messages recoverable (#365)
+
+## v3.6.9 - 2026-10-28
+
+- perf(masking): streamline framing and reuse redaction plans (#360)
+- perf(ci): parallelize navigation by host contract (#361)
+- perf(hooks): reuse the gitleaks readiness verdict across hook processes (#359)
+
+## v3.6.8 - 2026-10-27
+
+- fix(hooks): stop reading inert here-documents and plain-word git arguments as unknown code (#357)
+- Merge pull request #340 from JeongJaeSoon/codex/status-label-test-layers
+- Merge remote-tracking branch 'origin/main' into codex/local-chain-integration-20261024
+- Merge pull request #339 from JeongJaeSoon/codex/test-coverage-boundary
+- Merge branch 'codex/local-339-integration-20261024' into codex/local-chain-integration-20261024
+- test: revalidate selected locations after detector updates
+- test: revalidate selected locations after detector updates
+- Merge commit '0fb9d6cc2a017d57751aebe728ecf7ba72e832dd' into codex/local-chain-integration-20261024
+- Merge remote-tracking branch 'origin/main' into codex/local-chain-integration-20261024
+- Merge branch 'codex/test-coverage-boundary' into codex/status-label-test-layers
+- docs: date the recorded coverage observation
+- test: reject decision fields in fail-open prompt notices
+- Merge branch 'codex/exec-raw-probe-failure' into codex/test-coverage-boundary
+- Merge branch 'codex/test-coverage-boundary' into codex/status-label-test-layers
+- test: assert failure diagnostics do not expose fixture secrets
+- test: move status-label variants to direct classification contracts
+- test: document layers and guard exec framing failures
+
+## v3.6.7 - 2026-10-23
+
+- fix(hooks): stop over-masking booleans, page cursors and short multibyte words (#353)
+- ci: suite job の timeout を 25 分に上げる (#355)
+- fix(hooks): resolve command variables in any locale, after closed parens and before builtin-named arguments (#354)
+
+## v3.6.6 - 2026-10-23
+
+- fix(hooks): resolve a literal command variable in the git gate (#351)
+- fix(hooks): treat a bracket as a non-boundary before a spanning star (#350)
+- fix: Claude の PreToolUse hook が timeout・crash したら tool 呼び出しをブロックする (#349)
+- fix: inspect quoted substitutions and honor GIT_DIR in the git gate (#346)
+- Merge pull request #337 from JeongJaeSoon/codex/exec-raw-probe-failure
+- Merge pull request #336 from JeongJaeSoon/codex/prompt-assignment-failure-policy
+- Merge branch 'codex/prompt-assignment-failure-policy' into codex/exec-raw-probe-failure
+- Merge remote-tracking branch 'origin/main' into codex/prompt-assignment-failure-policy
+- fix: fail closed on exec raw probe errors
+- test: name synthetic assignment fixture explicitly
+- fix: preserve prompt assignment probe failures
+
+## v3.6.5 - 2026-10-22
+
+- fix: only treat unquoted names as assignments in the git gate (#345)
+- fix: follow an unquoted tilde cd target to HOME in the git gate (#344)
+- fix: require a pinned letter for one-character star stand-ins in Bash path text (#343)
+- test: add direct probe eligibility contracts (#335)
+- perf: avoid per-character subshells in deny-path regex construction (#334)
+- test: consolidate duplicated function extraction setup (#333)
+- test: cover framing producer byte and failure contracts (#332)
+- docs: document test layers and scoped source coverage (#329)
+- test: add fast version and shell quoting contracts (#331)
+- Merge pull request #327 from JeongJaeSoon/codex/ci-runtime-balance
+- ci: preserve OS temporary root for permission regression fixtures
+- docs: clarify preserved regression assertions and matrix check
+- ci: run isolated test partitions on bounded worker bundles
+- Merge remote-tracking branch 'origin/main' into codex/ci-runtime-balance
+- ci: balance output coverage against latest baseline
+- ci: balance test work and name suites by coverage
+
+## v3.6.4 - 2026-10-17
+
+- ci: bump hashgraph-online/ai-plugin-scanner-action (#312)
+- fix(hooks): explain every closed block from the manifest resolver (#325)
+
+## v3.6.3 - 2026-10-16
+
+- ci: remove unused scanner setup and simplify validation output (#320)
+- fix(pii): keep UTF-8 text out of byte-window regex matching (#322)
+- fix(detection): allow source-module mentions in static prose (#321)
+- fix(hooks): closed モードの遮断で毎回理由を返し、case の subject をコマンド扱いしない (#318)
+- perf(redaction): avoid quadratic assembly of complete framed leaves (#323)
+
+## v3.6.2 - 2026-10-15
+
+- fix(detection): stop the cwd re-parse from recursing on blankless words (#316)
+- fix(detection): keep env source modules readable after one static cwd change (#313)
+
+## v3.6.1 - 2026-10-12
+
+- MCP token 키의 `v:<n>` 버전 핸들을 불필요하게 마스킹하지 않도록 수정했습니다 (#309).
+- 릴리스 발행 후 Homebrew tap 갱신 PR을 자동 생성하며, 같은 formula와 열린 PR은 재사용합니다 (#310).
+- HOL 플러그인 스캐너 Action을 업데이트했습니다 (#302).
+
+## v3.6.0 - 2026-10-11
+
+- feat(hooks): show values the mask allow list names in the masked view (#307)
+- feat(hooks): mask deny-value rule matches in the masked view (#306)
+- feat(hooks): return a masked view in the block reason of a protected read (#305)
+- feat(cli): add mask-file, a masked view of json, yaml, ini and dotenv files (#304)
+- docs: add a sponsor line to the README (#301)
+
+## Unreleased
+
+- feat(hooks): in `AGENT_GUARD_DENY_READ_MODE=mask`, values whose key path matches a rule in `~/.config/agent-guard/mask-allow-keys.txt` are shown; the file must sit outside the work tree and the working directory and be private to the user, no variable can supply rules, deny-value rules and the secret scanner still win, and any refused rule or failed check keeps every value masked with a warning
+- feat(hooks): in `AGENT_GUARD_DENY_READ_MODE=mask`, deny-value rules from `~/.config/agent-guard/mask-deny-values.txt` and the file `AGENT_GUARD_MASK_DENY_VALUES` names, together, replace every match with `[MASKED]`, comments included; a refused or unreadable rule, a match in a key, or a rule that runs out of time blocks with no view
+- feat(hooks): `AGENT_GUARD_DENY_READ_MODE=mask` keeps blocking reads of protected files and puts a masked view of the file in the block reason for a `Read` or a plain `cat PATH`; the view is rescanned, capped at 6,144 bytes, and any failure blocks with no view
+- fix(hooks): a `~/` path no longer normalizes to `$HOME/~/...`
+- feat(cli): add `mask-file`, which prints a json, yaml, ini or dotenv file with its values replaced by `[MASKED]` and fails closed on anything else; `.envrc` and `*.envrc` are not supported because a shell, not a dotenv reader, reads them
+
+## v3.5.6 - 2026-10-04
+
+- fix(hooks): give Claude Code the block reason as JSON and stop echoing blocked prompts (#299)
+
+## v3.5.5 - 2026-10-04
+
+- chore: match the Action branding color to the new icon (#296)
+- docs: record the demo GIF inside Claude Code (#295)
+- chore(plugin): match the Codex brand color to the new icon (#293)
+- docs: add the Agent Guard icon and a centered README header (#292)
+- docs: re-record the demo GIF against the current CLI (#291)
+- chore: add GitHub Sponsors funding link (#290)
+- ci: bump hashgraph-online/ai-plugin-scanner-action (#289)
+- refactor: clean up stale comments, dead branches and drifted docs (#288)
+
+## v3.5.4 - 2026-09-27
+
+- fix(hooks): scan the git commit or push a git alias expands to (#286)
+- test: move the shell cd tests from shard 3 to shard 4 (#285)
+
+## v3.5.3 - 2026-09-25
+
+- fix(hooks): check shell -c, eval and split words that hide a git commit (#283)
+
+## v3.5.2 - 2026-09-25
+
+- fix(hooks): scan the repository a shell cd moves git commit and push into (#276)
+
+## v3.5.1 - 2026-09-25
+
+- fix(hooks): decode ANSI-C quoted words before the Bash path check (#279)
+- fix(hooks): let one star span several characters of a deny-read entry (#278)
+- ci(test): shard tests/run.sh across a five-way CI matrix (#277)
+- ci: bump hashgraph-online/ai-plugin-scanner-action (#274)
+- fix(hooks): scan changes git commit -a and pathspecs stage themselves (#275)
+- docs(readme): highlight commit and push secret blocking (#273)
+
 ## v3.5.0 - 2026-09-21
 
 - docs: remove maintainer-only documents and keep user-facing docs in English (#271)

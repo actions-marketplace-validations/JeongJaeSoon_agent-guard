@@ -12,8 +12,9 @@ permissions:
 env:
   # Single source of truth for the pinned gitleaks scanner, shared by the
   # secret-guard action invocation and the Test job's real-gitleaks install.
-  # Keep in lock-step with the defaults in action.yml, bin/agent-guard, and
-  # scripts/gitleaks-checksum.sh (tests/run.sh enforces that version sync).
+  # Keep in lock-step with release.yml and the defaults in action.yml,
+  # bin/agent-guard, and plugins/agent-guard/scripts/gitleaks-checksum.sh
+  # (tests/run.sh enforces that version sync).
   GITLEAKS_VERSION: "8.30.1"
   # sha256 of gitleaks_8.30.1_linux_x64.tar.gz. Linux/x64 runners only; a
   # different OS/arch archive has a different digest.
@@ -35,8 +36,8 @@ jobs:
           gitleaks-version: ${{ env.GITLEAKS_VERSION }}
           gitleaks-checksum: ${{ env.GITLEAKS_CHECKSUM_LINUX_X64 }}
 
-  test:
-    name: Test (${{ matrix.os }})
+  test-shard:
+    name: ${{ matrix.suite }} (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -47,10 +48,34 @@ jobs:
         # added blindly here to avoid a job that waits forever for a runner that
         # may not exist.
         os: [ubuntu-latest, macos-latest]
+        # Every assertion and host contract runs once per OS. Only the smaller
+        # core pair shares a runner; navigation is split by the Claude/Codex
+        # input contract and the long-running suites get independent capacity.
+        bundle: [core, commands, navigation-claude, navigation-codex, scanner]
+        include:
+          - bundle: core
+            suite: Core, host adapters and Git
+            shards: '1 3'
+          - bundle: commands
+            suite: Command policies
+            shards: '2'
+          - bundle: navigation-claude
+            suite: Shell navigation (Claude)
+            shards: '5'
+            navigation_host: claude
+          - bundle: navigation-codex
+            suite: Shell navigation (Codex)
+            shards: '5'
+            navigation_host: codex
+          - bundle: scanner
+            suite: CLI, scanner and output
+            shards: '4'
     runs-on: ${{ matrix.os }}
-    # Normal runs finish in ~2-3 min; the default 6h cap once left a dead
-    # macOS runner blocking the merge queue for an hour before manual cancel.
-    timeout-minutes: 20
+    # Keep a bounded runner lifetime. Partitions are balanced by measured
+    # test time, not assertion count; see docs/ci.md for mapping and evidence.
+    # The earlier ~14-minute partition 5 measurement was a child sharing one
+    # runner with partition 2, not an independent runner duration.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,14 +85,16 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned gitleaks (Linux x64)
-        # Real gitleaks is REQUIRED on Linux so tests/run.sh exercises its
+        # Only shard 4 consumes real gitleaks. Other shards use the bundled
+        # mock; installing the same archive there adds four unused downloads.
+        # Real gitleaks is REQUIRED on Linux shard 4 so tests/run.sh exercises its
         # real-detection block (the #124 anchored-placeholder scan-accuracy
         # regressions) and so `make smoke-test` can run end-to-end. On macOS the
         # suite self-skips the real-gitleaks block and uses the bundled mock,
         # which still gives cross-OS coverage of the rest of the suite. The
         # macOS/darwin archive has a different checksum than the pin above, so
         # the real-gitleaks + smoke steps are scoped to Linux only.
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.bundle == 'scanner'
         run: |
           set -euo pipefail
           archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
@@ -82,19 +109,23 @@ jobs:
           echo "${RUNNER_TEMP}/agent-guard-bin" >> "${GITHUB_PATH}"
 
       - name: Run tests
-        # pipefail so a tests/run.sh failure propagates through the tee pipe;
-        # without it the step would return tee's 0 status and a failing suite
-        # could go green — the exact fail-open class this PR closes.
+        env:
+          TEST_PARTITIONS: ${{ matrix.shards }}
+          AGENT_GUARD_TEST_NAVIGATION_HOST: ${{ matrix.navigation_host }}
         run: |
-          set -o pipefail
-          tests/run.sh 2>&1 | tee "${RUNNER_TEMP}/test-output.txt"
+          # IDs come only from the checked-in matrix; the driver validates
+          # one or two distinct IDs and preserves every child exit status.
+          read -r -a partitions <<< "$TEST_PARTITIONS"
+          bash .github/scripts/run-test-bundle.sh "${partitions[@]}"
 
       - name: Require real gitleaks integration ran (Linux)
         # Fail closed if the real-detection block silently self-skipped: on a
         # runner with no gitleaks, tests/run.sh drops the #124 regressions
         # without failing, which is exactly the green-but-untested state #134 is
         # about. On Linux gitleaks is installed above, so a skip here is a bug.
-        if: runner.os == 'Linux'
+        # The block lives in shard 4; moving it without updating this condition
+        # fails the grep below instead of passing silently.
+        if: runner.os == 'Linux' && matrix.bundle == 'scanner'
         run: |
           set -eu
           if grep -q 'real gitleaks not available; skipped real-gitleaks integration tests' "${RUNNER_TEMP}/test-output.txt"; then
@@ -105,8 +136,29 @@ jobs:
             || { echo "::error::expected real-gitleaks detection assertions are missing from the test output" >&2; exit 1; }
 
       - name: Smoke test (real git/jq/gitleaks E2E)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.bundle == 'scanner'
         run: make smoke-test
+
+  test:
+    # Keeps the check names release.yml requires. needs sees the shard matrix
+    # as one result, so either OS reports a failed shard on both OSes.
+    name: Test (${{ matrix.os }})
+    needs: test-shard
+    if: always()
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every test shard to pass
+        env:
+          SHARDS_RESULT: ${{ needs.test-shard.result }}
+        run: |
+          if [ "$SHARDS_RESULT" != success ]; then
+            echo "::error::test shards finished with: $SHARDS_RESULT" >&2
+            exit 1
+          fi
 
   lint:
     name: Lint
