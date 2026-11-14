@@ -41,6 +41,9 @@ healthy() {
   [ ! -L "$AGENT_GUARD_HOME/bin/agent-guard" ]
   "$1" version >"$CASE_ROOT/version"
   grep -q agent-guard "$CASE_ROOT/version"
+  for readme in README.md README.ko.md README.ja.md; do
+    cmp -s "$ROOT/$readme" "$AGENT_GUARD_HOME/$readme" || return 1
+  done
 }
 installed_state_unchanged() {
   [ "$payload_before" = "$(shasum -a 256 "$AGENT_GUARD_HOME/bin/agent-guard")" ]
@@ -223,6 +226,15 @@ installed_state_unchanged
 grep -q 'unexpected top-level entry' "$CASE_ROOT/err"
 check 'checksum-valid unexpected archive entry leaves working installation untouched'
 
+rm "$CASE_ROOT/invalid-policy/unexpected-file"
+printf 'unexpected\n' >"$CASE_ROOT/invalid-policy/README.unreviewed.md"
+tar -C "$CASE_ROOT/invalid-policy" -czf "$CASE_ROOT/download/agent-guard-2.0.0.tar.gz" .
+(cd "$CASE_ROOT/download" && shasum -a 256 agent-guard-2.0.0.tar.gz >agent-guard-2.0.0.tar.gz.sha256)
+if AGENT_GUARD_BIN_DIR="$CASE_ROOT/custom bin" sh "$ROOT/bootstrap.sh" >"$CASE_ROOT/out" 2>"$CASE_ROOT/err"; then exit 1; fi
+installed_state_unchanged
+grep -q 'unexpected top-level entry: README.unreviewed.md' "$CASE_ROOT/err"
+check 'checksum-valid unreviewed README leaves working installation untouched'
+
 cp "$CASE_ROOT/valid.tar.gz" "$CASE_ROOT/download/agent-guard-2.0.0.tar.gz"
 if AGENT_GUARD_BIN_DIR="$CASE_ROOT/custom bin" sh "$ROOT/bootstrap.sh" >"$CASE_ROOT/out" 2>"$CASE_ROOT/err"; then exit 1; fi
 installed_state_unchanged
@@ -235,3 +247,62 @@ if AGENT_GUARD_BIN_DIR="$CASE_ROOT/directory-target" sh "$ROOT/bootstrap.sh" >"$
 grep -q preserve "$CASE_ROOT/directory-target/agent-guard/note"
 installed_state_unchanged
 check 'directory link target is rejected without changing existing data'
+
+# Fail at real installation transaction boundaries, after payload validation.
+# The old executable, public link and unrelated user file must all survive.
+export QA_REAL_TAR QA_REAL_MV
+QA_REAL_TAR=$(command -v tar)
+QA_REAL_MV=$(command -v mv)
+mkdir "$CASE_ROOT/fault-bin"
+cat >"$CASE_ROOT/fault-bin/tar" <<'FAULT'
+#!/bin/sh
+previous= destination=
+for arg do
+  if [ "$previous" = -C ]; then destination=$arg; fi
+  previous=$arg
+done
+case "$destination:${QA_INSTALL_FAULT:-}" in
+  */.agent-guard-update.*/next:extract)
+    printf 'broken staged file\n' >"$destination/bin/agent-guard"
+    exit 2 ;;
+esac
+exec "$QA_REAL_TAR" "$@"
+FAULT
+cat >"$CASE_ROOT/fault-bin/mv" <<'FAULT'
+#!/bin/sh
+case "$1:${QA_INSTALL_FAULT:-}" in
+  */.agent-guard-update.*/next:commit) exit 2 ;;
+esac
+case "${2:-}:${QA_INSTALL_FAULT:-}" in
+  */.agent-guard-link.*/agent-guard:link) exit 2 ;;
+esac
+"$QA_REAL_MV" "$@" || exit $?
+for destination do :; done
+case "$destination:${QA_INSTALL_FAULT:-}" in
+  */.agent-guard-update.*/previous:interrupt) kill -TERM "$PPID" ;;
+  */.agent-guard-update.*/previous:interrupt-int) kill -INT "$PPID" ;;
+esac
+FAULT
+chmod +x "$CASE_ROOT/fault-bin/tar" "$CASE_ROOT/fault-bin/mv"
+# CI partitions run as asynchronous children and can inherit SIGINT ignored.
+# A POSIX shell cannot restore a signal ignored when it starts. Use the Perl
+# already used by the runtime's portable process launcher to give the installer
+# a foreground-like signal disposition, including on macOS /bin/sh.
+command -v perl >/dev/null 2>&1 || { echo 'signal fault tests require perl' >&2; exit 1; }
+for fault in extract commit interrupt interrupt-int link; do
+  fault_status=0
+  if PATH="$CASE_ROOT/fault-bin:$PATH" QA_INSTALL_FAULT="$fault" \
+    AGENT_GUARD_BIN_DIR="$CASE_ROOT/custom bin" \
+    perl -e '$SIG{INT} = "DEFAULT"; $SIG{TERM} = "DEFAULT"; exec @ARGV; die "exec installer: $!"' \
+      sh "$ROOT/bootstrap.sh" >"$CASE_ROOT/out" 2>"$CASE_ROOT/err"; then
+    echo "fault did not fail the installation: $fault" >&2; exit 1
+  else
+    fault_status=$?
+  fi
+  case "$fault" in
+    interrupt) [ "$fault_status" -eq 143 ] ;;
+    interrupt-int) [ "$fault_status" -eq 130 ] ;;
+  esac
+  installed_state_unchanged
+  check "transaction $fault failure restores the working install and public link"
+done

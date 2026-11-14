@@ -1,0 +1,240 @@
+name: Native platform artifacts
+on:
+  # Release consumes only the main push run; pull requests run this only
+  # when they change what the native, install or packaged jobs execute.
+  pull_request:
+    paths:
+      - '.github/workflows/native-platforms.yml'
+      - 'native/**'
+      - 'bench/native/**'
+      - 'bench/fused-output/**'
+      - 'plugins/agent-guard/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'bootstrap.sh'
+      - 'install.sh'
+      - 'deployment/**'
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  platform:
+    name: Native execution (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        timeout-minutes: 5
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal --target "$TARGET"
+      # Keep repository refresh and package installation visible separately.
+      # A stalled runner/mirror must fail within the original job budget and
+      # must not consume it silently before any native contract can execute.
+      - name: Refresh Linux package metadata
+        if: runner.os == 'Linux'
+        timeout-minutes: 4
+        run: |
+          sudo apt-get -o Acquire::Retries=0 \
+            -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 \
+            -o DPkg::Lock::Timeout=30 update --error-on=any
+      - name: Install Linux musl tools
+        if: runner.os == 'Linux'
+        timeout-minutes: 4
+        run: |
+          sudo apt-get -o Acquire::Retries=0 \
+            -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 \
+            -o DPkg::Lock::Timeout=30 install -y musl-tools
+      - name: Build and execute release artifact
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          sh scripts/build-native-artifact.sh "$TARGET" "$RUNNER_TEMP/artifacts"
+          cargo +1.85.1 build --release --locked --manifest-path native/devtools/Cargo.toml
+          sh scripts/install-native-test-tools.sh "$RUNNER_TEMP/test-bin"
+      - name: Compiler-free differential
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          export PATH="$RUNNER_TEMP/test-bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          if command -v cargo || command -v rustc; then
+            echo 'Rust compiler unexpectedly visible on runtime test PATH' >&2
+            exit 1
+          fi
+          date -u
+          native/devtools/target/release/agent-guard-devtools native-redaction --core "$RUNNER_TEMP/artifacts/agent-guard-redact-$TARGET" > "$RUNNER_TEMP/artifacts/differential.json"
+          date -u
+      - name: Preserve Intel differential checkpoint
+        if: always() && matrix.target == 'x86_64-apple-darwin'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: checkpoint-intel-differential
+          path: ${{ runner.temp }}/artifacts/differential.json
+          if-no-files-found: warn
+      - name: Compiler-free integration
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          export PATH="$RUNNER_TEMP/test-bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          if command -v cargo || command -v rustc; then
+            echo 'Rust compiler unexpectedly visible on runtime test PATH' >&2
+            exit 1
+          fi
+          date -u
+          native/devtools/target/release/agent-guard-devtools native-integration --core "$RUNNER_TEMP/artifacts/agent-guard-redact-$TARGET" --scanner "$RUNNER_TEMP/test-bin/gitleaks" > "$RUNNER_TEMP/artifacts/integration.json"
+          date -u
+      - name: Preserve Intel integration checkpoint
+        if: always() && matrix.target == 'x86_64-apple-darwin'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: checkpoint-intel-integration
+          path: ${{ runner.temp }}/artifacts/integration.json
+          if-no-files-found: warn
+      - name: Compiler-free integration-2
+        if: matrix.target == 'x86_64-apple-darwin'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          export PATH="$RUNNER_TEMP/test-bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          if command -v cargo || command -v rustc; then
+            echo 'Rust compiler unexpectedly visible on runtime test PATH' >&2
+            exit 1
+          fi
+          date -u
+          native/devtools/target/release/agent-guard-devtools native-integration --core "$RUNNER_TEMP/artifacts/agent-guard-redact-$TARGET" --scanner "$RUNNER_TEMP/test-bin/gitleaks" > "$RUNNER_TEMP/artifacts/integration-2.json"
+          date -u
+      - name: Preserve Intel integration-2 checkpoint
+        if: always() && matrix.target == 'x86_64-apple-darwin'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: checkpoint-intel-integration-2
+          path: ${{ runner.temp }}/artifacts/integration-2.json
+          if-no-files-found: warn
+      - name: Compiler-free integration-3
+        if: matrix.target == 'x86_64-apple-darwin'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          export PATH="$RUNNER_TEMP/test-bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          if command -v cargo || command -v rustc; then
+            echo 'Rust compiler unexpectedly visible on runtime test PATH' >&2
+            exit 1
+          fi
+          date -u
+          native/devtools/target/release/agent-guard-devtools native-integration --core "$RUNNER_TEMP/artifacts/agent-guard-redact-$TARGET" --scanner "$RUNNER_TEMP/test-bin/gitleaks" > "$RUNNER_TEMP/artifacts/integration-3.json"
+          date -u
+      - name: Preserve Intel integration-3 checkpoint
+        if: always() && matrix.target == 'x86_64-apple-darwin'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: checkpoint-intel-integration-3
+          path: ${{ runner.temp }}/artifacts/integration-3.json
+          if-no-files-found: warn
+      - name: Compiler-free audit contracts
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          export PATH="$RUNNER_TEMP/test-bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          if command -v cargo || command -v rustc; then
+            echo 'Rust compiler unexpectedly visible on runtime test PATH' >&2
+            exit 1
+          fi
+          date -u
+          AGENT_GUARD_RUST_CORE_BIN="$RUNNER_TEMP/artifacts/agent-guard-redact-$TARGET" sh tests/native-suite.sh audit 2>&1 | tee "$RUNNER_TEMP/artifacts/audit.log"
+          date -u
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: native-${{ matrix.target }}
+          path: ${{ runner.temp }}/artifacts/
+          if-no-files-found: error
+  installation:
+    name: Native installation (${{ matrix.os }})
+    needs: platform
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: native-*
+          path: ${{ runner.temp }}/downloaded
+      - name: Prepare qualified artifacts and runtime dependencies
+        run: |
+          mkdir -p "$RUNNER_TEMP/native" "$RUNNER_TEMP/install-evidence"
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
+            dir="$RUNNER_TEMP/downloaded/native-$target"
+            cp "$dir"/agent-guard-redact-* "$RUNNER_TEMP/native/"
+          done
+          chmod 755 "$RUNNER_TEMP/native"/agent-guard-redact-*
+          sh scripts/install-native-test-tools.sh "$RUNNER_TEMP/test-bin"
+      - name: Compiler-free fresh install, published update and failure recovery
+        run: |
+          export PATH="$RUNNER_TEMP/test-bin:/usr/bin:/bin:/usr/sbin:/sbin"
+          if command -v cargo || command -v rustc; then
+            echo 'Rust compiler unexpectedly visible on runtime test PATH' >&2
+            exit 1
+          fi
+          export AGENT_GUARD_NATIVE_ARTIFACT_DIR="$RUNNER_TEMP/native"
+          sh tests/packaged-performance-gate.sh > "$RUNNER_TEMP/install-evidence/performance-gate.log" 2>&1
+          sh tests/native-release.sh > "$RUNNER_TEMP/install-evidence/release-selection.log" 2>&1
+          sh tests/tempdir-failure.sh > "$RUNNER_TEMP/install-evidence/tempdir-failure.log" 2>&1
+          sh tests/native-install.sh > "$RUNNER_TEMP/install-evidence/install.log" 2>&1
+          sh tests/native-install.sh 3.7.1 > "$RUNNER_TEMP/install-evidence/install-from-3.7.1.log" 2>&1
+          sh tests/bootstrap-update.sh > "$RUNNER_TEMP/install-evidence/bootstrap.log" 2>&1
+          case "$(uname -s):$(uname -m)" in
+            Linux:x86_64) target=x86_64-unknown-linux-musl ;;
+            Linux:aarch64) target=aarch64-unknown-linux-musl ;;
+            Darwin:x86_64) target=x86_64-apple-darwin ;;
+            Darwin:arm64) target=aarch64-apple-darwin ;;
+            *) exit 2 ;;
+          esac
+          sh tests/native-packaged.sh "$RUNNER_TEMP/native/agent-guard-redact-$target" "$RUNNER_TEMP/test-bin/gitleaks" > "$RUNNER_TEMP/install-evidence/fallback.log" 2>&1
+          sh tests/fused-packaged.sh "$RUNNER_TEMP/native/agent-guard-redact-$target" "$RUNNER_TEMP/test-bin/gitleaks" > "$RUNNER_TEMP/install-evidence/fused-packaged.log" 2>&1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: native-install-${{ matrix.os }}
+          path: ${{ runner.temp }}/install-evidence/
+          if-no-files-found: error
+  complete:
+    name: Native platform artifacts
+    if: always()
+    # Performance measurement runs in performance.yml (nightly, manual and
+    # release PRs), so this run's conclusion is the release qualification.
+    needs: [platform, installation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all four native executions
+        env:
+          RESULT: ${{ needs.platform.result }}
+          INSTALL: ${{ needs.installation.result }}
+        run: test "$RESULT" = success && test "$INSTALL" = success

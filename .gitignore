@@ -1,2 +1,29 @@
 # Benchmark artifacts (regenerable via `make bench`)
 bench/results.tsv
+
+# Developer build/cache output. Cargo.lock remains tracked.
+/native/**/target/
+**/__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local measurements and raw results are not committed. Keep them in bench/local/,
+# a release asset or a CI artifact. Only the recorded comparison read by
+# tests/devtools.sh is tracked.
+/bench/local/
+/bench/results/*
+!/bench/results/rust-experiment/
+/bench/results/**/build.log
+/bench/results/**/cli-*.log
+
+# Output of `devtools report`: the generated HTML and its chart exports.
+/docs/rust-*.html
+/docs/assets/rust-*.svg
+
+# Release assets are built locally or attached to GitHub Releases.
+/agent-guard-*.tar.gz
+/agent-guard-*.tar.gz.sha256
+/agent-guard.rb
+
+# Qualified binaries are attached to releases, never source commits.
+/plugins/agent-guard/libexec/

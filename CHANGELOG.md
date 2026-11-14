@@ -1,3 +1,148 @@
+## Unreleased
+
+- fix(scan): `clientId`·`tokenRef`·`credential_ref`·`token_id`처럼 이름 끝이 `Id`·`Ref`·`_id`·`_ref`인 칸에 소문자 UUID 하나만 있으면 `generic-api-key` finding으로 보지 않습니다. Edit/Write 검사, 커밋 검사, `scan-path`, 출력 마스킹에 똑같이 적용됩니다. 접미사 앞 이름이 대소문자와 관계없이 `secret`이나 `secrets`로 끝나면(`secretId`, `secretRef`, `secret_ref`, `clientSecretRef`, `secret_id`) 이전과 같이 잡습니다. Vault AppRole과 Consul/Nomad의 secret id가 UUID이기 때문입니다. `SecretID`·`SECRET_ID`·`secret-id`, 대문자 UUID, 같은 줄의 다른 secret, 공급자 전용 UUID 규칙(Heroku, Snyk, HubSpot)도 그대로 잡습니다. 따옴표 UUID 뒤에 글자가 이어져 셸에서 더 긴 값이 되면 새 규칙 `agent-guard-reference-id-concatenation`이 잡습니다. 다만 secret이 아닌 참조 id의 셸 대입에서 따옴표 UUID 바로 뒤에 `,` `]` `}` 한 글자만 붙고 값이 끝나면, Python 여러 줄 키워드 인자와 구별할 수 없어 잡지 않습니다.
+
+## v3.8.2 - 2026-11-06
+
+- fix(hooks): heredoc 본문과 산문 placeholder를 오탐으로 막지 않는다 (#423)
+- ci: PR의 Fused contracts에서 macOS Intel 잡을 뺀다 (#417)
+- fix(hooks): 마스킹된 토큰 값을 secret-like 할당으로 오인하지 않는다 (#416)
+- ci: bump actions/upload-artifact from 4.6.2 to 7.0.2 (#401)
+- ci: bump actions/setup-go from 6.5.0 to 7.0.0 (#400)
+- ci: bump actions/download-artifact from 4.3.0 to 8.0.2 (#399)
+- ci: bump hashgraph-online/ai-plugin-scanner-action (#402)
+- ci: 성능 비교를 차단 조건에서 빼고 중복 잡을 줄인다 (#415)
+
+## v3.8.1 - 2026-11-06
+
+- fix(hooks): 메시지 본문 오탐을 줄이고 set·$(env) 환경 출력 구멍을 막는다 (#405)
+- ci: PR macOS matrix를 줄이고 전체 검증 체크를 구분한다 (#408)
+
+## v3.8.0 - 2026-11-05
+
+### 선택형 출력 처리 통합
+
+- 기존 core에 JSON 문자열 추출·framing을 위한 `prepare-v1`을 추가하고, private 중간 파일과 출력 처리를 통합하는 선택형 경로를 제공합니다. 전체 재작성은 아니며 탐지·scanner·정책·PII·호스트 계약은 기존 셸에 남습니다. 기본 출력 파이프라인은 바꾸지 않습니다.
+- `AGENT_GUARD_EXPERIMENTAL_OUTPUT_PIPELINE=fused`와 검증된 절대 `AGENT_GUARD_EXPERIMENTAL_OUTPUT_PREPARE_BIN`을 함께 선택합니다. 소스만 있는 Git marketplace 플러그인은 기존 `AGENT_GUARD_RUST_CORE_BIN`도 같은 바이너리로 지정해 준비·치환에 공유합니다. 두 번째 helper나 Rust 컴파일러 설치는 필요하지 않습니다. helper 실패·누락은 원래 jq 단계로, 모듈 누락은 원래 파이프라인으로 복귀합니다. 선택 설정을 지우고 호스트를 재시작하면 기본 경로로 돌아갑니다.
+- Claude/Codex의 기존 설치·업데이트 명령을 유지합니다. Git marketplace 설치는 같은 릴리스의 독립 사전 빌드 core를 연결할 수 있으며 호스트 캐시를 수정할 필요가 없습니다. 신뢰하는 실행 파일 재정의 계약과 체크섬 검증 방법은 [설치 안내](https://github.com/JeongJaeSoon/agent-guard/blob/v3.8.0/docs/installation.ko.md)를 참고하세요.
+
+### 기본 경로의 수정
+
+- 일반 문자열 출력의 framing에서 이스케이프가 없는 구간을 한 번에 처리해 긴 값의 반복 복사 비용을 줄입니다. 이스케이프가 있는 구간은 기존 상태 처리를 유지하며 제어 문자·비 UTF-8 바이트·문맥 경계·최장 일치의 독립 기대값을 검사합니다. 마스킹 범위와 scanner는 바꾸지 않습니다.
+- 호스트가 절대 경로의 일반 실행 파일을 호출할 때 셸 내장 경로 처리를 사용해 시작 시 자식 프로세스 두 개를 줄입니다. 상대 경로·심볼릭 링크 체인의 기존 해석과 실제 설치 루트 선택은 유지합니다.
+- 문자열 없는 상한 초과 숫자/불리언 JSON의 보수적 복귀에서 항등 변환과 큰 인자 복사를 줄입니다. 해당 ASCII 구간에만 C locale을 적용한 뒤 이전 값과 set/unset 상태를 복원합니다. 기존 327680-byte 상한, 구조·숫자 치환 기대값, 20초 조건을 유지합니다.
+- 버전 확인 자식이 이미 종료됐는데 부모 처리가 지연되면 watchdog이 늦게 timeout으로 바꾸던 경합을 수정합니다. 이미 회수된 자식과 아직 회수되지 않은 zombie 상태를 구분하며, 상태 조회 실패 때는 보수적인 timeout 처리를 유지합니다. 정상 종료·실패 종료·실제 지연 자식의 전후 검사를 포함합니다. 실제로 실행 중인 scanner의 2초 제한과 open/closed 정책은 바꾸지 않습니다.
+- 최초 v3.7.0 Intel 출력 불일치의 자료가 없으므로 동일 원인으로 소급 확정하지 않습니다. 후속 실제 CI에서 scanner 준비 timeout을 관측했지만, 위 경합이 모든 간헐 지연의 원인이라고 주장하지 않습니다. 공개 기준본의 진단 실패도 원시 자료에 남깁니다.
+
+### 성능 근거와 한계
+
+사전 실험 head `9fb3c1d`는 실제 공개 v3.7.0을 기준으로 같은 scanner·입력·설정, 실제 2CPU/1GiB/swap0에서 시작 비용 포함 9쌍 교대 측정을 수행했습니다. 두 호스트·audit 세 상태·scanner 세 종류의 378개 비교에서 독립 출력 불일치와 일반 경로 지연·CPU 5% 초과 회귀는 0이었습니다.
+
+- stdlib 비교 빌드의 다중 문자열 목표: 지연 15.34~16.78%, CPU 13.92~15.08% 감소.
+- 실제 Homebrew scanner의 같은 목표: 지연 14.07~17.05%, CPU 12.48~15.38% 감소.
+- 공식 scanner의 같은 목표: 지연 2.93~5.82%, CPU 3.88~6.19% 감소. 모든 설치나 작업에 10% 개선을 주장하지 않습니다.
+- Claude/Homebrew 부하 검사에서 동시 4요청 처리량은 6.02→7.34 req/s, CPU는 2.652→2.261초/8요청이었지만, 표본 RSS 합은 214.35→236.98MiB로 증가했습니다. 최대 자식 RSS와 공유 페이지를 중복 집계할 수 있는 표본 RSS 합은 구분합니다. 메모리 절감은 입증하지 않았습니다.
+
+위 원인별 실험은 공개 redactor를 양쪽에 유지하고 prepare helper를 분리한 구성입니다. 실제 설치의 공유 core 구성도 공식/Homebrew와 audit 세 상태에서 별도로 측정하며, 독립 출력·일반 경로 회귀·Homebrew 목표 개선을 배포 관문으로 검사합니다. 숫자 fallback의 단일 진단 시간을 평균 성능으로 사용하지 않습니다. 설치 비용과 반복 사용의 손익, 실패한 후보 및 최종 설치 구성의 원시는 [상세 보고서](https://github.com/JeongJaeSoon/agent-guard/blob/codex/fused-output-evidence/bench/results/fused-output/README.ko.md)에서 구분합니다.
+
+호환성을 깨야 할 필요성은 확인하지 못했습니다. v4.0.0을 위한 불필요한 계약 변경을 만들지 않고 선택형 기능을 v3.x에 추가합니다. 공식 scanner의 의존성 실험을 전체 설치에 적용하면 Homebrew에서 회귀하므로 scanner 일괄 교체는 계속 기각합니다.
+
+## v3.7.1 - 2026-11-04
+
+### 출력 복구와 진단
+
+- jq 1.8.1처럼 깊은 JSON을 정상 종료 상태로 불완전하게 출력하는 경우, 손상된 중간 응답 대신 보존된 원본 PostToolUse 이벤트에서 복구합니다. 독립 parser가 성공하면 중첩 배열 구조를 유지하며 호스트 응답을 한 번만 출력합니다. 원본도 복구할 수 없을 때의 비밀값 없는 실패 응답은 유지합니다.
+- scanner 준비 실패 경고에 `Scanner readiness: timeout.` 같은 고정 원인 코드를 추가합니다. 입력·파일 경로·scanner 원문은 포함하지 않으며 기존 시간 제한, open/closed 정책, 세션별 경고 제한을 유지합니다. timeout 코드는 실패 단계를 나타내며 간헐적 준비 지연의 근본 원인이 해결됐다는 의미는 아닙니다.
+- CLI·설정·탐지·마스킹·호스트 계약과 기존 Claude/Codex 설치 방식을 유지합니다. 일반 사용자에게 Rust 또는 Go 컴파일러 설치를 요구하지 않습니다. 공개 자산의 체크섬 검증, 네 플랫폼 바이너리 선택, 셸 경로 복귀와 기존 정상 설치 보존은 v3.7.0의 계약을 유지합니다.
+
+### 성능 실험의 범위
+
+공식 gitleaks의 초기화 비용을 줄이는 의존성 후보를 별도 빌드하여 실제 공개 v3.7.0과 비교했습니다. 제한 자원에서 큰 개선을 확인했지만 Homebrew의 기존 backend에는 회귀가 있어 전체 설치 교체를 기각했습니다. 이 후보는 이 릴리스의 기본 scanner에 포함하지 않습니다. 실험 개선율을 v3.7.1의 사용자 성능 개선으로 해석하지 마세요. 기존 Rust 준비 후보도 목표 10% 개선에 못 미쳐 채택하지 않았습니다.
+
+- [실험·기각 근거와 미해결 항목](https://github.com/JeongJaeSoon/agent-guard/blob/v3.7.1/bench/scanner/README.ko.md)
+- [실패를 포함한 원시 측정과 체크섬](https://github.com/JeongJaeSoon/agent-guard/tree/v3.7.1/bench/results/scanner-startup)
+- [검증 안내](https://github.com/JeongJaeSoon/agent-guard/blob/v3.7.1/docs/verification.ko.md)
+
+호환성을 깨야 할 필요성은 입증되지 않았으므로 v4.0.0 전환을 추가하지 않았습니다.
+
+## v3.7.0 - 2026-11-04
+
+기존 CLI·설정·출력·종료 코드·마스킹 정책과 호스트 계약을 유지하면서, 검증된 문자열 치환 코어를 사전 빌드 Rust 바이너리로 제공합니다. 일반 사용자는 Rust를 설치할 필요가 없습니다. 탐지·PII·정책·호스트 어댑터는 셸에 남으며 전체 Rust 재작성이 아닙니다.
+
+### 배포와 복구
+
+- Linux/macOS × x64/arm64 바이너리와 SHA-256을 공개 자산 및 기존 universal archive에 포함합니다. Linux는 정적 musl이며 glibc 의존성이 없습니다. macOS 배포 대상은 14 이상이고 실제 검증 환경은 두 아키텍처 모두 macOS 15입니다. 그 밖의 OS·커널 실행까지 입증한 것으로 일반화하지 않습니다.
+- 배포 아카이브와 Homebrew에서는 해당 플랫폼 바이너리의 체크섬을 확인하고 기본으로 사용합니다. 부재·손상·체크섬 불일치·실행 오류·빈/부분/복수 JSON 출력은 원래 셸/jq 경로로 복귀합니다. `AGENT_GUARD_EXPERIMENTAL_REDACTOR=shell`은 명시적 셸 선택으로 유지합니다.
+- Git marketplace 플러그인과 소스 아카이브는 바이너리가 없으므로 셸을 사용합니다. 기존 `AGENT_GUARD_RUST_CORE_BIN`으로 검증된 독립 설치의 바이너리를 지정할 수 있으며 Rust 컴파일이나 호스트 캐시 수정은 필요하지 않습니다.
+- 업데이트를 기존 설치 옆에서 준비하고 검증한 뒤 같은 파일시스템에서 교체합니다. 추출·커밋·공개 링크 실패 및 INT/TERM에 대해 기존 정상 설치를 복구합니다. SIGKILL·전원 손실 때의 남은 `previous` 디렉터리 복구는 설치 안내를 따릅니다.
+- 릴리스는 최종 PR head와 병합 커밋의 필수 검사 및 네 플랫폼 실제 실행·설치·성능 검증을 요구합니다. 다른 SHA의 바이너리를 발행하거나 기존 공개 자산을 덮어쓰지 않습니다.
+- jq 1.6의 입력 끝 NUL 제거 때문에 `exec -- printenv`가 빈 값과 정상 값을 과도 마스킹하던 문제를 고쳤습니다. 인자 경계와 실패 시 전체 마스킹은 유지합니다.
+
+### 측정과 범위
+
+기본 전환 전 Linux x64의 실제 2 CPU·1 GiB·swap 없음 제한에서, 같은 입력·gitleaks 8.30.1·설정으로 시작 비용과 배포 체크섬 검증까지 포함해 측정했습니다. Claude 목표 경로 지연 22.20%·CPU 20.68%, Codex 지연 21.96%·CPU 21.06%가 개선됐고 일반 경로 지연 5% 초과 회귀는 없었습니다. 동시 작업 4개 처리량은 1.562→2.059 요청/초입니다. 이는 해당 입력·환경의 결과이며 다른 플랫폼의 성능이나 메모리 절감 입증이 아닙니다.
+
+- [지원 조건·선택·실패 복귀](https://github.com/JeongJaeSoon/agent-guard/blob/v3.7.0/docs/native-redactor.md)
+- [실측 검증 기록과 재현 방법](https://github.com/JeongJaeSoon/agent-guard/blob/v3.7.0/docs/rust-packaged-validation.ko.md)
+- [새 측정 원본](https://github.com/JeongJaeSoon/agent-guard/tree/v3.7.0/bench/results/rust-packaged/qualification-30d7df8)
+
+현재 병목만으로 호환성을 깨야 할 필요성은 입증되지 않았습니다. 영역별 후속 후보와 판단 근거를 문서화했고, 버전 번호를 위한 v4 변경은 추가하지 않았습니다.
+
+## v3.6.15 - 2026-11-04
+
+### 변경 사항
+
+- **draft snapshot token 과잉 마스킹 수정**: 문서 도구의 draft 조회 결과에 들어 있는 `d<n>:` 형식의 snapshot token 을 더 이상 가리지 않고, 이 토큰을 인용한 프롬프트도 차단하지 않습니다. 다음 update 요청에 이 토큰을 그대로 보낼 수 있습니다. 면제 조건은 정확한 `snapshotToken`/`snapshot_token` 키와 해당 값 형식이 함께 맞는 경우뿐입니다. 다른 secret 키 아래의 같은 값, env 형식, 그 밖의 값 형식은 계속 가립니다. (#387)
+- **Rust 배포 후보 CI**: 네 플랫폼에서 Rust 바이너리를 빌드하고 실제로 실행해 확인하는 CI 를 추가했습니다. 일반 설치 경로는 바뀌지 않습니다. (#388)
+- **문서 정리**: 중복 검토 문서를 통합하고, 사용자·개발·측정 자료를 다시 구성했습니다. v3.6.14 발행과 설치 검증 근거를 반영했습니다. (#382)
+
+## v3.6.14 - 2026-11-04
+
+기본 셸 실행의 병목과 도구 호환성을 개선하고, 측정으로 효과를 확인한 Rust 문자열 치환기를 선택형 실험으로 추가했습니다. 일반 설치에 Rust 의존성이 추가되지 않으며 기본 마스킹 정책은 유지합니다.
+
+### 변경 사항
+
+- **셸 성능·프로세스 정리**: 중복 jq 처리와 불필요한 문자열 분할을 줄이고 watchdog 종료 시 남는 프로세스를 정리했습니다. (#377)
+- **jq 1.6 과도 마스킹 수정**: NUL이 없는 정상 문자열까지 마스킹되던 판정을 수정했습니다. 실제 NUL이 포함된 값은 계속 보호합니다. (#379)
+- **구형 awk 로그 보존 수정**: 반복 정규식을 지원하지 않는 awk에서도 기존 감사 로그 보존 정책이 적용됩니다. (#378)
+- **shell 스크립트 인자 판정**: 단일 문자열 변수로 넘긴 스크립트 경로를 리터럴 경로와 동일하게 처리해 안전한 반복 실행의 오탐을 줄였습니다. `-c` 값은 코드로 검사하고 불명확한 값은 기존 closed 정책으로 차단합니다. (#385)
+- **선택형 Rust 치환기**: 문자열 치환 단계만 Rust로 실행할 수 있습니다. 바이너리가 없거나 실행이 실패하면 기존 jq 경로로 복귀하고 부분 출력은 폐기합니다. 탐지기·정책·호스트 어댑터는 유지합니다. (#380)
+- **개발 도구 Rust 이관**: Python 검증·측정·보고서 스크립트 10개를 Rust 명령으로 옮기고 Python 실행 의존성을 제거했습니다. 기존 입력·기대값·통계 동등성을 유지하며 Python 없는 Docker와 Linux/macOS 계약 검사를 추가했습니다. (#386)
+- **측정·시각화**: 반복 측정 원시 데이터, 재현 명령, 한국어 그래프 HTML 보고서를 추가했습니다. (#381)
+- **CI**: 같은 PR의 이전 실행만 취소하고 main·수동·릴리스 검증은 보존합니다. jq/awk·Rust 계약 검사를 관련 main 변경에도 실행합니다. HOL scanner를 v1.2.806으로 갱신했습니다. (#383, #364)
+
+### 측정 결과와 적용 범위
+
+최적화된 셸과 Rust를 같은 Docker 환경에서 비교한 결과입니다. 전체 CLI 실행 시간을 측정했으며 Rust 코어만의 속도와 구분했습니다.
+
+| 측정 항목 | 최적화된 셸 | 선택형 Rust | 변화 |
+| --- | ---: | ---: | ---: |
+| Claude 다수 문자열 치환 지연 | 1,194.1 ms | 868.2 ms | 27.3% 감소 |
+| 같은 경로 CPU 시간 | 1,236.4 ms | 910.8 ms | 26.3% 감소 |
+| 동시 작업 4개 처리량 | 2.20 요청/초 | 3.08 요청/초 | 40.3% 증가 |
+| 동시 작업 4개 표본 RSS 합 | 271.9 MiB | 281.9 MiB | 3.7% 증가 |
+
+메모리 절감은 입증되지 않았습니다. Docker의 컨테이너별 CPU·메모리 제한은 해당 환경에서 적용되지 않았으며 양쪽은 동일한 상위 자원 한도를 공유했습니다. RSS 합은 표본 측정으로 공유 페이지 중복과 순간 최대치 누락 가능성이 있습니다. 이 수치를 모든 입력·운영체제나 전체 Rust 재작성의 효과로 일반화하지 않습니다.
+
+### 호환성·검증
+
+- 차등 검사 1,024건, jq 1.7.1/1.6 각각 호스트·복귀 검사 90건, 기존/Rust 출력 회귀 각각 1,018건, 단위 검사 201건을 통과했습니다.
+- 기본 실행은 셸/jq입니다. 일반 사용자는 Rust를 설치할 필요가 없습니다. Rust 실험을 직접 빌드하는 개발자에게만 빌드 도구가 필요하며, 이 릴리스는 플랫폼별 Rust 바이너리를 배포하지 않습니다.
+- 실험 활성화·복귀 동작: [native-redactor.md](https://github.com/JeongJaeSoon/agent-guard/blob/v3.6.14/docs/native-redactor.md)
+- 그래프 HTML: [rust-performance.ko.html](https://github.com/JeongJaeSoon/agent-guard/blob/v3.6.14/docs/rust-performance.ko.html) (다운로드 후 브라우저에서 열기)
+- [원시 측정값·검증 근거](https://github.com/JeongJaeSoon/agent-guard/tree/v3.6.14/bench/results/rust-experiment)
+
+## v3.6.13 - 2026-11-03
+
+- fix(scan): bare key 필드의 레코드 UUID를 generic-api-key 오탐에서 제외 (#375)
+
+## v3.6.12 - 2026-11-02
+
+- fix(hooks): grep/rg 검색 패턴과 새 openssl 출력 경로를 보호 경로 검사에서 제외 (#373)
+- fix(hooks): jq filter field names no longer trip the protected-path check (#372)
+- docs: 영어 정본을 유지하고 한국어·일본어 안내 추가 (#369)
+- docs: 직접 계약 테스트 목록과 Makefile 도움말 정합성 정리 (#362)
+
 ## v3.6.11 - 2026-10-30
 
 - fix(hooks): resolve commit and push in compound Bash commands (#367)

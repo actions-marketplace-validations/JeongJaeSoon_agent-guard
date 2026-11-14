@@ -10,11 +10,11 @@ help:
 	@printf '  make check         Verify deps and print installed gitleaks version.\n'
 	@printf '  make install       Configure the native git pre-commit hook.\n'
 	@printf '  make test          Run the test suite (uses a mock gitleaks).\n'
-	@printf '  make test-unit     Run fast core, framing, deny-path, probe and status-label contracts.\n'
+	@printf '  make test-unit     Run fast direct contracts (suite inventory: docs/development/testing.md).\n'
 	@printf '  make test-pleno-integration  Run opt-in tests against a real pleno endpoint.\n'
 	@printf '  make smoke-test    Run real git/jq/gitleaks end-to-end checks.\n'
 	@printf '  make bench         Run the leak-prevention channel-coverage benchmark (real gitleaks).\n'
-	@printf '  make bench-masking Run verified masking latency samples (Python 3, real gitleaks).\n'
+	@printf '  make bench-masking Run verified masking latency samples (Rust devtools, real gitleaks).\n'
 	@printf '  make scan          Scan the working tree for secrets.\n'
 	@printf '  make scan-staged   Scan staged changes only.\n'
 	@printf '  make checksum [VERSION=X.Y.Z]   Fetch gitleaks-checksum for every supported OS/arch (CI typically picks linux/x64).\n'
@@ -36,8 +36,11 @@ test-unit:
 	@sh tests/unit-framing.sh
 	@sh tests/unit-deny-path.sh
 	@sh tests/unit-probe.sh
+	@sh tests/unit-watchdog.sh
+	@sh tests/unit-audit-retention.sh
 	@sh tests/unit-status-label.sh
 	@sh tests/redaction-plan.sh
+	@sh tests/unit-nul-redaction.sh
 
 test-pleno-integration:
 	@tests/run-pleno-integration.sh
@@ -49,7 +52,7 @@ bench:
 	@sh bench/run.sh
 
 bench-masking:
-	@python3 bench/masking-latency.py
+	@sh scripts/devtools.sh masking-latency
 
 scan:
 	@plugins/agent-guard/bin/agent-guard scan-working-tree

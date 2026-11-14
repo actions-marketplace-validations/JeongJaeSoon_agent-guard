@@ -10,6 +10,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/JeongJaeSoon/agent-guard" alt="MIT license"></a>
 </p>
 
+English · [한국어](README.ko.md) · [日本語](README.ja.md)
+
 **A local-first guardrail that keeps AI coding agents from leaking your secrets.**
 
 > Blocks risky `.env` reads, masks secret-like output, and scans changes before they reach Git. No hosted account, no telemetry.
@@ -128,6 +130,12 @@ currently supported. One of `setsid` (from `util-linux` on Linux) or Perl is
 also required to run the gitleaks version probe in its own process group.
 `agent-guard doctor` reports a missing isolation tool with the install command
 for your platform.
+
+Release archives and Homebrew packages use a prebuilt Rust helper for literal
+replacement, with checksum verification and shell fallback. Rust is not a
+runtime dependency; detection, policy and host adapters remain in shell.
+Git marketplace plugins remain source-only. See [installation](docs/installation.md)
+for platform requirements, explicit shell selection and prebuilt helper use.
 
 Default processing is local and ephemeral. Read [Privacy](PRIVACY.md) before
 enabling an endpoint-backed PII provider. Read [Security](SECURITY.md) for

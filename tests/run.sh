@@ -152,16 +152,18 @@ in_navigation_host() {
 }
 
 if in_shard 1; then
+run_expect 0 "CI scope keeps reduced checks separate from release evidence" sh "$ROOT/tests/ci-scope.sh"
 run_expect 0 "core function contracts" sh "$ROOT/tests/unit-core.sh"
 run_expect 0 "framing producer contracts" sh "$ROOT/tests/unit-framing.sh"
 run_expect 0 "deny-path character producer contracts" sh "$ROOT/tests/unit-deny-path.sh"
 run_expect 0 "probe eligibility contracts" sh "$ROOT/tests/unit-probe.sh"
+run_expect 0 "watchdog timer cleanup contracts" sh "$ROOT/tests/unit-watchdog.sh"
 run_expect 0 "status-label classification contracts" sh "$ROOT/tests/unit-status-label.sh"
 suite_shards=$(sed -n 's/^if in_shard \([0-9]*\); then$/\1/p' "$ROOT/tests/run.sh" | sort -u | tr '\n' ' ')
 ci_shards=$(sed -n "s/^ *shards: '\([0-9 ][0-9 ]*\)'$/\1/p" "$ROOT/.github/workflows/ci.yml" | tr ' ' '\n' | sort | tr '\n' ' ')
 ci_navigation_hosts=$(awk '$1 == "navigation_host:" { print $2 }' "$ROOT/.github/workflows/ci.yml" | sort | tr '\n' ' ')
 if [ -n "$suite_shards" ] && [ "$suite_shards" = '1 2 3 4 5 ' ] \
-  && [ "$ci_shards" = '1 2 3 4 5 5 ' ] \
+  && [ "$ci_shards" = '1 1 2 3 3 4 5 5 ' ] \
   && [ "$ci_navigation_hosts" = 'claude codex ' ]; then
   ok "every test shard and navigation host runs in the CI matrix"
 else
@@ -207,6 +209,9 @@ for file in \
   "$ROOT/tests/deny-read-mask-allow.sh" \
   "$ROOT/tests/gitleaks-resolution.sh" \
   "$ROOT/tests/gitleaks-probe-cache.sh" \
+  "$ROOT/tests/gitleaks-clean-cache.sh" \
+  "$ROOT/tests/deny-path-regex-cache.sh" \
+  "$ROOT/tests/hook-spawn-reduction.sh" \
   "$ROOT/tests/run.sh"; do
   run_expect 0 "shell syntax: $file" sh -n "$file"
 done
@@ -229,6 +234,9 @@ else
 fi
 
 run_expect 0 "private metadata-only audit logging contract" sh "$ROOT/tests/audit-log.sh"
+run_expect 0 "portable audit retention contract" sh "$ROOT/tests/unit-audit-retention.sh"
+run_expect 0 "NUL redaction preserves clean leaves" sh "$ROOT/tests/unit-nul-redaction.sh"
+run_expect 0 "printenv argument boundaries preserve empty and public values" sh "$ROOT/tests/printenv-argument-contract.sh"
 run_expect 0 "host plugin lifecycle delegates safely" sh "$ROOT/tests/plugin-management.sh"
 
 run_expect 0 "standalone update preserves executable and link destinations" \
@@ -363,7 +371,7 @@ fi
 
 if grep -Fq -- '--json headRefOid,mergeCommit' "$ROOT/.github/workflows/release.yml" \
    && grep -Fq 'checks: read' "$ROOT/.github/workflows/release.yml" \
-   && grep -Fq "required_checks=\$'Agent Guard\\nTest (ubuntu-latest)\\nTest (macos-latest)\\nLint\\nPlugin Layout\\nHOL Plugin Scanner'" "$ROOT/.github/workflows/release.yml" \
+   && grep -Fq "required_checks=\$'Agent Guard\\nTest (ubuntu-latest)\\nTest (macos-latest)\\nLint\\nPlugin Layout\\nHOL Plugin Scanner\\nNative platform artifacts'" "$ROOT/.github/workflows/release.yml" \
    && grep -Fq 'commits/${release_head_sha}/check-runs?filter=latest&per_page=100' "$ROOT/.github/workflows/release.yml" \
    && grep -Fq 'if [ "$check_result" != "success" ]' "$ROOT/.github/workflows/release.yml" \
    && grep -Fq 'release_head_sha=$release_head_sha' "$ROOT/.github/workflows/release.yml"; then
@@ -1473,6 +1481,41 @@ expect_json_status 2 "Bash glob wildcard path bypass is blocked" \
   '{"tool_name":"Bash","tool_input":{"command":"cat .e?v"}}' \
   hook-pre-tool
 
+# A digit-only bracket cannot match a letter, so `e[0-9]*.` is no spelling of
+# `env.*` even though the word is read as a glob. Any bracket that can hold a
+# letter still counts.
+expect_json_status 0 "Bash sed capture group over e[0-9]* remains allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"orca snapshot | sed -n '\''s/.*ref=\\(e[0-9]*\\).*/@\\1/p'\''"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash glob e[n]* with a letter bracket is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat e[n]*.local"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash glob e[0-9n]* with a mixed bracket is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat e[0-9n]*.local"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash glob e[^0-9]* with a negated bracket is blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"cat e[^0-9]*.local"}}' \
+  hook-pre-tool
+
+# Judged true blocks in the 2026-11-06 false-positive review. A count of
+# matching lines still reads the file and answers a guess at a value; a path
+# handed to another program is read by that program; a search after an
+# unlisted command stays in the scan because that command may replace grep.
+expect_json_status 2 "Bash grep -c over a dotenv file stays blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"grep -c '\''^API_KEY=.'\'' proj/.env.local"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash path of a key file handed to another program stays blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool upload --element e37 --files /home/u/.config/app/app-key.pem"}}' \
+  hook-pre-tool
+
+expect_json_status 2 "Bash search text after an unlisted pipeline command stays blocked" \
+  '{"tool_name":"Bash","tool_input":{"command":"tool snapshot --page p1 | grep -n '\''Private key (.pem)\"'\''"}}' \
+  hook-pre-tool
+
 # One `*` can expand over several characters of a deny entry, so a star after
 # any pinned prefix still names the protected file.
 expect_json_status 2 "Bash trailing star over a protected dotfile is blocked" \
@@ -1620,18 +1663,22 @@ expect_json_status 2 "ripgrep positive glob over a denied extension remains bloc
   '{"tool_name":"Bash","tool_input":{"command":"rg --files -g '\''*.pem'\''"}}' \
   hook-pre-tool
 
-# A star that stands for one entry character must come with a pinned letter.
-# Each case runs through both hosts' native event shapes.
-star_stand_in_fixtures="$ROOT/tests/fixtures/bash-star-stand-in.json"
+# A star that stands for one entry character must come with a pinned letter,
+# and a jq filter's field names are not file operands. Each case runs through
+# both hosts' native event shapes.
 star_stand_in_cases="$TESTTMP/bash-star-stand-in.cases"
 star_stand_in_dir="$TESTTMP/bash-star-stand-in"
 mkdir -p "$star_stand_in_dir"
-if jq -e 'type == "array" and length > 0' "$star_stand_in_fixtures" >/dev/null \
-  && jq -c '.[]' "$star_stand_in_fixtures" >"$star_stand_in_cases"; then
-  ok "star stand-in fixture corpus is valid and non-empty"
-else
-  not_ok "star stand-in fixture corpus is valid and non-empty"
-fi
+: >"$star_stand_in_cases"
+for star_stand_in_fixtures in "$ROOT/tests/fixtures/bash-star-stand-in.json" \
+  "$ROOT/tests/fixtures/bash-jq-field-names.json"; do
+  if jq -e 'type == "array" and length > 0' "$star_stand_in_fixtures" >/dev/null \
+    && jq -c '.[]' "$star_stand_in_fixtures" >>"$star_stand_in_cases"; then
+    ok "${star_stand_in_fixtures##*/} fixture corpus is valid and non-empty"
+  else
+    not_ok "${star_stand_in_fixtures##*/} fixture corpus is valid and non-empty"
+  fi
+done
 while IFS= read -r star_stand_in_fixture; do
   star_stand_in_expected=$(printf '%s' "$star_stand_in_fixture" | jq -r '.expected_status')
   star_stand_in_name=$(printf '%s' "$star_stand_in_fixture" \
@@ -1701,11 +1748,11 @@ expect_stderr_missing "in scanned text" \
 expect_stderr_contains "rewrite" \
   "Bash path block suggests a non-path-shaped rewrite"
 
-expect_json_status 2 "jq selector false positive reports its deny-read entry" \
-  '{"tool_name":"Bash","tool_input":{"command":"jq '\''.key'\'' d.json"}}' \
+expect_json_status 2 "yq selector false positive reports its deny-read entry" \
+  '{"tool_name":"Bash","tool_input":{"command":"yq '\''.key'\'' d.yaml"}}' \
   hook-pre-tool
 expect_stderr_contains "matched deny-read-paths entry '*.key'" \
-  "jq selector block names the deny-read entry that matched"
+  "yq selector block names the deny-read entry that matched"
 
 expect_json_status 2 "URL path false positive reports its deny-read entry" \
   '{"tool_name":"Bash","tool_input":{"command":"curl https://example.com/a.pem"}}' \
@@ -1744,17 +1791,20 @@ bash_diag_no_leak "prefix wildcard eating a URL userinfo field" \
 bash_diag_no_leak "prefix wildcard eating a directory component" \
   "cat /home/$bash_diag_token/id_rsa"
 
-# The diagnosis is the whole fix: no command-name exemption was added, so every
-# shape that merely looks safe must still block. `git commit -m` in particular
-# is NOT exempt -- a shadowed `git` (alias, function, PATH shim) could hand that
-# operand to a reader, which is exactly the case README's Known Limitations
-# refuses to exempt by apparent command name.
-expect_json_status 2 "git commit message operand is not exempt" \
+# A quoted literal `git commit -m` message is data, not a file operand, but only
+# while nothing on the line can redefine `git` (a function, alias, eval, source,
+# hash or PATH change keeps the whole line in the scan). tests/
+# message-value-prose.sh holds the shadowing controls.
+expect_json_status 0 "a quoted git commit message is not a file operand" \
   '{"tool_name":"Bash","tool_input":{"command":"git commit -m '\''fix foo.key parse'\''"}}' \
   hook-pre-tool
 
-expect_json_status 2 "double-quoted git commit message operand is not exempt" \
+expect_json_status 0 "a double-quoted git commit message is not a file operand" \
   '{"tool_name":"Bash","tool_input":{"command":"git commit -m \"fix foo.key parse\""}}' \
+  hook-pre-tool
+
+expect_json_status 2 "an unquoted git commit message is still scanned" \
+  '{"tool_name":"Bash","tool_input":{"command":"git commit -m id_rsa"}}' \
   hook-pre-tool
 
 expect_json_status 2 "attached git commit message operand is not exempt" \
@@ -1979,6 +2029,31 @@ PASSWORD=not-a-real-password' \
 prompt_guard_placeholder_lookalike_json=$(jq -nc \
   --arg prompt 'API_KEY=example_token_value_long' '{prompt:$prompt}')
 
+# Values another tool already masked are not credentials; a real-shaped body
+# after the same prefix still is. The bodies are generated at run time so no
+# committed literal resembles a live token.
+prompt_guard_masked_json=$(jq -nc --arg prompt \
+  'gh auth status
+  - Token: ghu_****************************
+  - Token: github_pat_xxxxxxxxxxxxxxxxxxxxxxxx
+password: <redacted>
+token: ***
+Token: ghp_••••••••••••
+api_key: sk-XXXXXXXXXXXX
+secret:
+running: false
+type: agent' \
+  '{prompt:$prompt}')
+prompt_guard_token_body=$(od -An -N20 -tx1 /dev/urandom | LC_ALL=C tr -d ' \n')
+prompt_guard_real_ghu_json=$(jq -nc --arg v "$prompt_guard_token_body" \
+  '{prompt: ("Token: ghu_" + $v)}')
+prompt_guard_partial_mask_json=$(jq -nc --arg v "$prompt_guard_token_body" \
+  '{prompt: ("Token: ghu_****" + $v)}')
+prompt_guard_real_pat_json=$(jq -nc --arg v "$prompt_guard_token_body" \
+  '{prompt: ("token=github_pat_" + $v)}')
+prompt_guard_generic_json=$(jq -nc --arg v "$prompt_guard_token_body" \
+  '{prompt: ("password: " + $v)}')
+
 for pg_h in claude codex; do
   run_expect 2 "prompt guard blocks a pasted secret by default ($pg_h)" \
     prompt_guard_case "$pg_h" '' '' '{"prompt":"my key is AGENT_GUARD_TEST_SECRET"}'
@@ -1991,6 +2066,21 @@ for pg_h in claude codex; do
 
   run_expect 2 "prompt guard blocks a decorated placeholder lookalike ($pg_h)" \
     prompt_guard_case "$pg_h" '' '' "$prompt_guard_placeholder_lookalike_json"
+
+  run_expect 0 "prompt guard allows masked token samples and empty values ($pg_h)" \
+    prompt_guard_case "$pg_h" '' '' "$prompt_guard_masked_json"
+
+  run_expect 2 "prompt guard blocks a real-shaped ghu_ token ($pg_h)" \
+    prompt_guard_case "$pg_h" '' '' "$prompt_guard_real_ghu_json"
+
+  run_expect 2 "prompt guard blocks a partly masked token with a real tail ($pg_h)" \
+    prompt_guard_case "$pg_h" '' '' "$prompt_guard_partial_mask_json"
+
+  run_expect 2 "prompt guard blocks a real-shaped github_pat_ token ($pg_h)" \
+    prompt_guard_case "$pg_h" '' '' "$prompt_guard_real_pat_json"
+
+  run_expect 2 "prompt guard blocks a generic high-entropy password ($pg_h)" \
+    prompt_guard_case "$pg_h" '' '' "$prompt_guard_generic_json"
 
   prompt_guard_case "$pg_h" '' '' '{"prompt":"please refactor the login handler"}' >"$OUT" 2>"$ERR"
   if [ $? -eq 0 ] && [ ! -s "$OUT" ]; then
@@ -2381,6 +2471,9 @@ make_deep_post_tool_input() {
   awk -v count="$deep_count" 'BEGIN { for (i = 0; i < count; i++) printf "]" }'
   printf '%s' '}'
 }
+
+run_expect 0 "post-tool serialization recovers from the retained envelope" \
+  sh "$ROOT/tests/post-tool-serialization-recovery.sh"
 
 make_deep_post_tool_expected() {
   deep_count=$1
@@ -2781,10 +2874,29 @@ expect_json_status 0 "env VAR=x cmd piped (wrapped command, not bare env) is all
   '{"tool_name":"Bash","tool_input":{"command":"env FOO=bar printf %s done | cat"}}' \
   hook-pre-tool
 
-# Bash provides one opaque command string, so source/search operands that look
-# like protected paths stay blocked. These policy-only fixtures verify both the
-# actionable diagnosis and the supported structured/script alternatives; none
-# of the embedded commands is executed.
+# Bash provides one opaque command string, so source operands that look like
+# protected paths stay blocked; only the search pattern of a plain grep/rg and
+# a new openssl output path are left out. These policy-only fixtures verify both
+# the actionable diagnosis and the supported structured/script alternatives;
+# none of the embedded commands is executed. The ground-truth script runs them.
+run_expect 0 "grep/rg search patterns and new openssl outputs leave out no protected read" \
+  sh "$ROOT/tests/search-operand-ground-truth.sh"
+run_expect 0 "orca/gh/git message values leave out no protected read" \
+  sh "$ROOT/tests/message-value-prose.sh"
+run_expect 0 "runtime environment objects and jq interpolation leave out no protected read" \
+  sh "$ROOT/tests/runtime-global-text.sh"
+run_expect 0 "ORCA_ and CLAUDE_JOB_DIR lookups pass while secret dumps stay blocked" \
+  sh "$ROOT/tests/env-lookup-allowlist.sh"
+run_expect 0 "the protected-path regex cache only rules commands out and never changes a verdict" \
+  sh "$ROOT/tests/deny-path-regex-cache.sh"
+run_expect 0 "hook process shortcuts answer exactly as the processes they replace (#407)" \
+  sh "$ROOT/tests/hook-spawn-reduction.sh"
+run_expect 0 "cat/tee here-document bodies leave out no protected read" \
+  sh "$ROOT/tests/heredoc-body-text.sh"
+run_expect 0 "a failed quoted-bracket normalization keeps the protected-path verdict" \
+  sh "$ROOT/tests/quoted-bracket-fallback.sh"
+run_expect 0 "status words and named placeholders are prose, real values still block" \
+  sh "$ROOT/tests/prompt-prose-placeholder.sh"
 ambiguous_bash_fixtures="$ROOT/tests/fixtures/ambiguous-bash-protected-path.json"
 ambiguous_bash_cases="$TESTTMP/ambiguous-bash-protected-path.cases"
 if jq -e 'type == "array" and length > 0' "$ambiguous_bash_fixtures" >/dev/null \
@@ -2862,6 +2974,30 @@ expect_json_status 0 "Read example.envrc template is allowed" \
 expect_json_status 0 "Read local.env.example template is allowed" \
   '{"tool_name":"Read","tool_input":{"file_path":"local.env.example"}}' \
   hook-pre-tool
+
+# Issue #426: a named template under a directory (`<name>.env.example`) is the
+# same template for a Bash read on both hosts, directly and after a static
+# `./` cd. A runtime sibling in the same command keeps the block.
+for env_example_host in claude codex; do
+  for env_example_case in \
+    "0|cat infra/test-ops.env.example" \
+    "0|sed -n 1,80p infra/test-ops.env.example" \
+    "0|cd ./infra && cat test-ops.env.example" \
+    "2|cat infra/test-ops.env.example infra/test-ops.env"; do
+    env_example_expected=${env_example_case%%|*}
+    env_example_command=${env_example_case#*|}
+    jq -nc --arg c "$env_example_command" '{tool_name:"Bash",tool_input:{command:$c}}' \
+      | AGENT_GUARD_HOOK_HOST=$env_example_host \
+          "$PLUGIN_ROOT/bin/agent-guard" hook-pre-tool >"$OUT" 2>"$ERR"
+    env_example_status=$?
+    if [ "$env_example_status" -eq "$env_example_expected" ]; then
+      ok "Bash $env_example_command exits $env_example_expected ($env_example_host)"
+    else
+      not_ok "Bash $env_example_command exits $env_example_expected ($env_example_host, got $env_example_status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+done
 
 expect_json_status 0 "Bash cat template.env is allowed" \
   '{"tool_name":"Bash","tool_input":{"command":"cat template.env"}}' \
@@ -3206,6 +3342,16 @@ expect_json_status 2 "Bash cat .env.tpl.bak (tpl marker not final) is blocked" \
 # program cannot safely drop its operands, so it drops none: the #99 false
 # positive stays, and the read stays blocked.
 #
+# One deliberate exception: bash_neutralize_jq_field_names drops field names
+# from the filter of a plain `jq` in a fully literal command (its fixture is
+# tests/fixtures/bash-jq-field-names.json). It does not drop an operand; every
+# other word, the jq file operands included, is still checked, and any
+# redefinition of jq in the command text keeps the old block. What it cannot
+# see is a jq function or PATH shim left by an earlier command. The owner
+# accepted that residual (2026-10-27): earlier-command state already gets past
+# this text gate without jq, for example a path assembled from variables set in
+# a previous call.
+#
 # The exts are composed at runtime because a literal in this file would trip the
 # gate under test.
 NONPATH_KEY=$(printf 'k%s' 'ey')
@@ -3219,8 +3365,8 @@ for nonpath_case in \
   "echo see also foo.$NONPATH_PEM" \
   "echo see also foo.env" \
   "printf '%s' foo.$NONPATH_KEY" \
-  "jq -r .$NONPATH_KEY data.json" \
-  "jq .$NONPATH_KEY"; do
+  "yq -r .$NONPATH_KEY data.yaml" \
+  "./jq .$NONPATH_KEY"; do
   expect_json_status 2 "#99 Bash '$nonpath_case' keeps the accepted false positive" \
     "$(jq -nc --arg c "$nonpath_case" \
       '{tool_name:"Bash",tool_input:{command:$c}}')" \
@@ -3230,7 +3376,9 @@ done
 # Every case below reads the file for real (verified with `bash -c` against a
 # fixture directory) and was ALLOWED by some revision of the narrowing. They all
 # block trivially now that nothing is stripped; they stay as the standing
-# counter-examples any re-attempt has to answer.
+# counter-examples any re-attempt has to answer. Bare `jq .env` left this list
+# with the jq exception above: it reads the file only through a jq function or
+# shim defined before the command, the residual named there.
 nonpath_newline_env=$(printf 'echo hi\ncat .env')
 nonpath_newline_ssh=$(printf 'echo one\necho two\ncat .ssh/id_rsa')
 nonpath_newline_sec=$(printf 'printf x\ncat secrets.json')
@@ -3268,7 +3416,6 @@ for nonpath_case in \
   "\"echo foo\" .env" \
   "'echo' .env" \
   "\"echo\" .env" \
-  "jq .env" \
   "yq .env" \
   "yq -r .env" \
   "gojq . .env" \
@@ -3529,6 +3676,23 @@ expect_json_status 0 "set -e is allowed" \
 expect_json_status 0 "set -o pipefail is allowed" \
   '{"tool_name":"Bash","tool_input":{"command":"set -o pipefail"}}' \
   hook-pre-tool
+
+for set_dump in 'set | grep -i tok' 'set > out.txt' 'set|base64' 'x; set | head'; do
+  expect_json_status 2 "piped or redirected set is blocked: $set_dump" \
+    "$(jq -nc --arg c "$set_dump" '{tool_name:"Bash",tool_input:{command:$c}}')" \
+    hook-pre-tool
+done
+expect_json_status 0 "a regex alternation naming set is allowed" \
+  '{"tool_name":"Bash","tool_input":{"command":"grep -E \"a|set|b\" notes.txt"}}' \
+  hook-pre-tool
+
+# The 1Password CLI must be its own word: prose such as `stop reading` is not.
+for op_case in '2|op read op://v/i/f' '2|/usr/local/bin/op read op://v/i/f' \
+  '2|x; op item get foo' "0|echo 'we stop reading now'" '0|echo "loop item getter"'; do
+  expect_json_status "${op_case%%|*}" "1Password CLI word boundary: ${op_case#*|}" \
+    "$(jq -nc --arg c "${op_case#*|}" '{tool_name:"Bash",tool_input:{command:$c}}')" \
+    hook-pre-tool
+done
 
 expect_json_status 0 "export of a single variable is allowed" \
   '{"tool_name":"Bash","tool_input":{"command":"export FOO=bar"}}' \
@@ -5453,6 +5617,28 @@ export SC_SESSION=\"\$(basename \"\$PWD\")_\$\$\"
 do
   shellcd_case claude secret 0 "$sc_command" a
 done
+# A shell's script operand held in such a variable is that script file, as
+# when it is written out: a helper run once per item in a loop.
+for sc_command in \
+  'S=/dev/null; bash "$S" 1 body-1.md results' \
+  'S="/dev/null"; for n in 1 2 3; do bash "$S" $n body-$n.md results; done' \
+  'S=/dev/null; sh $S' \
+  'S=/dev/null; bash -- "${S}" x'
+do
+  shellcd_case claude secret 0 "$sc_command" a
+done
+# The value is substituted, not trusted as a file: an option still reads the
+# words after it, and any other way of setting the variable stays unknown.
+shellcd_case codex secret 2 "S=-c; bash \"\$S\" 'git commit -m x'" a
+for sc_command in \
+  "S=/dev/null; S=-c; bash \"\$S\" 'git commit -m x'" \
+  "S=\$(printf -- -c); bash \"\$S\" 'git commit -m x'" \
+  "S=/dev/null; read S <<<-c; bash \"\$S\" 'git commit -m x'"
+do
+  shellcd_case claude secret U2 "$sc_command" a
+done
+shellcd_case codex secret Ux "bash \"\$SC_UNSET\" 'git commit -m x'" a
+shellcd_case claude secret Ux "S=/dev/null; bash -c 'bash \"\$S\" \"git commit -m x\"'" a
 # A quoted command word whose value is unknown is one word, git at worst: it
 # fails per the policy only when its arguments could commit or push.
 shellcd_case codex secret 0 '"$SC_UNSET" deploy --env prod' a
@@ -5765,6 +5951,7 @@ fi
 fi # end of shard 5
 
 if in_shard 4; then
+run_expect 0 "scanner report validation stays fail-closed" sh "$ROOT/tests/scanner-report.sh"
 SYMLINK_REPO="$TMP_ROOT/symlink-repo"
 mkdir -p "$SYMLINK_REPO"
 (
@@ -7928,11 +8115,19 @@ fi
 
 run_expect 0 "direct scan dependency statuses and recovery" \
   "$REAL_SH" "$ROOT/tests/direct-scan-status.sh"
+run_expect 0 "regular and linked executable paths select the same payload" \
+  "$REAL_SH" "$ROOT/tests/script-location.sh"
 run_expect 0 "deterministic gitleaks resolution and capability diagnostics" \
   "$REAL_SH" "$ROOT/tests/gitleaks-resolution.sh"
+run_expect 0 "completed scanner probes retain their status after parent scheduling delay" \
+  "$REAL_SH" "$ROOT/tests/gitleaks-probe-completion.sh"
+run_expect 0 "unreaped completed scanner probes retain their exit status" \
+  "$REAL_SH" "$ROOT/tests/gitleaks-probe-zombie.sh"
 run_expect 0 "gitleaks readiness cache reuses only a fresh verdict for the same binary" \
   env AGENT_GUARD_TEST_REAL_GITLEAKS="$REAL_GITLEAKS" \
   "$REAL_SH" "$ROOT/tests/gitleaks-probe-cache.sh"
+run_expect 0 "gitleaks clean-verdict cache skips only an identical clean scan (#407)" \
+  "$REAL_SH" "$ROOT/tests/gitleaks-clean-cache.sh"
 run_expect 0 "setup and manifest hook outcome contracts" \
   "$REAL_SH" "$ROOT/tests/hook-outcome-contract.sh"
 
@@ -11488,6 +11683,97 @@ else
   sed 's/^/  out: /' "$OUT"
 fi
 
+# A document tool's draft read returns a `d<n>:`-prefixed base64 snapshot
+# token for optimistic locking, and the next update has to echo it verbatim.
+# Masking it made every draft update impossible, and the prompt guard blocked
+# a prompt quoting it. Only that shape under the exact snapshot-token key is
+# exempt; the same value under any other secret key, a qualified key, the env
+# form, or a differently shaped value still masks.
+SNAP_ST=$(printf '%s%s' snapshot Token)
+SNAP_SNAKE=$(printf '%s%s' snapshot _token)
+SNAP_ENV=$(printf '%s%s' SNAPSHOT _TOKEN)
+SNAP_AT=$(printf '%s%s' access _token)
+SNAP_AUTH=$(printf '%s%s' Author ization)
+SNAP_BEARER=$(printf 'Ab9%s' "$(od -An -N14 -tx1 /dev/urandom | tr -d ' \n')")
+SNAP_URL=d1:$(head -c 48 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')
+SNAP_STD=d7:$(head -c 32 /dev/urandom | base64 | tr -d '\n')
+SNAP_PAD=d1:$(head -c 31 /dev/urandom | base64 | tr -d '\n')
+SNAP_SECRET=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+for snap_host in claude codex; do
+  for snap_text in "{\"id\":\"1\",\"$SNAP_ST\":\"$SNAP_URL\",\"status\":\"draft\"}" \
+                   "{\"$SNAP_ST\": \"$SNAP_STD\"}" \
+                   "{\"$SNAP_SNAKE\":\"$SNAP_PAD\"}" \
+                   "$SNAP_SNAKE: $SNAP_URL"; do
+    snap_input=$(jq -nc --arg t "$snap_text" \
+      '{tool_name:"mcp__example__getDraft",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+    printf '%s' "$snap_input" \
+      | (cd "$TMP_ROOT" && AGENT_GUARD_HOOK_HOST=$snap_host \
+          "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+    if [ "$?" -eq 0 ] && [ ! -s "$OUT" ]; then
+      ok "post-tool leaves a draft snapshot token visible ($snap_host)"
+    else
+      not_ok "post-tool leaves a draft snapshot token visible ($snap_host)"
+      sed 's/^/  out: /' "$OUT"
+    fi
+  done
+
+  run_expect 0 "prompt guard allows a prompt quoting a draft snapshot token ($snap_host)" \
+    prompt_guard_case "$snap_host" '' '' "$(jq -nc --arg p \
+      "publish the draft with {\"$SNAP_ST\": \"$SNAP_URL\"}" '{prompt:$p}')"
+done
+
+snap_case=0
+for snap_text in \
+  "{\"$VREF_PW\":\"$SNAP_URL\"}" \
+  "{\"$VREF_AK\":\"$SNAP_URL\"}" \
+  "{\"$SNAP_AT\":\"$SNAP_URL\"}" \
+  "{\"${SNAP_ST}_id\":\"$SNAP_URL\"}" \
+  "{\"my$(printf '%s%s' Snapshot Token)\":\"$SNAP_URL\"}" \
+  "$SNAP_ENV=$SNAP_URL" \
+  "{\"$SNAP_ST\":\"x1:$SNAP_SECRET\"}" \
+  "{\"$SNAP_ST\":\"$SNAP_SECRET\"}" \
+  "{\"$SNAP_ST\":\"d1:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.$SNAP_SECRET\"}"; do
+  snap_case=$((snap_case + 1))
+  snap_input=$(jq -nc --arg t "$snap_text" \
+    '{tool_name:"mcp__example__getDraft",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+  post_tool_out "$snap_input"
+  if grep -q '\[REDACTED\]' "$OUT" \
+     && ! grep -Fq "$SNAP_URL" "$OUT" && ! grep -Fq "$SNAP_SECRET" "$OUT"; then
+    ok "post-tool still masks a snapshot-shaped value elsewhere or another shape (case $snap_case)"
+  else
+    not_ok "post-tool still masks a snapshot-shaped value elsewhere or another shape (case $snap_case)"
+    sed 's/^/  out: /' "$OUT"
+  fi
+done
+
+snap_input=$(jq -nc \
+  --arg t "{\"$SNAP_ST\":\"$SNAP_URL\",\"$VREF_PW\":\"$SNAP_SECRET\"}" \
+  '{tool_name:"mcp__example__getDraft",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+snap_expected=$(printf '{"%s":"%s","%s":"[%s]"}' "$SNAP_ST" "$SNAP_URL" "$VREF_PW" REDACTED)
+post_tool_out "$snap_input"
+if jq -e --arg expected "$snap_expected" \
+     '.hookSpecificOutput.updatedToolOutput.content[0].text == $expected' \
+     "$OUT" >/dev/null 2>&1; then
+  ok "post-tool keeps a draft snapshot token and masks a secret in the same response"
+else
+  not_ok "post-tool keeps a draft snapshot token and masks a secret in the same response"
+  sed 's/^/  out: /' "$OUT"
+fi
+
+snap_input=$(jq -nc \
+  --arg t "$(printf '{"%s":"%s"}\n%s: Bearer %s' "$SNAP_ST" "$SNAP_URL" "$SNAP_AUTH" "$SNAP_BEARER")" \
+  '{tool_name:"mcp__example__getDraft",tool_input:{},tool_response:{content:[{type:"text",text:$t}]}}')
+snap_expected=$(printf '{"%s":"%s"}\n%s: Bearer [%s]' "$SNAP_ST" "$SNAP_URL" "$SNAP_AUTH" REDACTED)
+post_tool_out "$snap_input"
+if jq -e --arg expected "$snap_expected" \
+     '.hookSpecificOutput.updatedToolOutput.content[0].text == $expected' \
+     "$OUT" >/dev/null 2>&1; then
+  ok "post-tool keeps a draft snapshot token and masks a bearer token in the same response"
+else
+  not_ok "post-tool keeps a draft snapshot token and masks a bearer token in the same response"
+  sed 's/^/  out: /' "$OUT"
+fi
+
 # A secret-bearing key with a boolean or null value is a config flag, not a
 # credential. Masking `true`/`false` also made the literal global, so the same
 # word vanished from unrelated prose in the response, and the prompt guard
@@ -11603,6 +11889,134 @@ if [ -n "$REAL_GITLEAKS" ]; then
     "$BOOL_PAGE_ENV=$BOOL_CURSOR"
   bool_gl_case 1 "a prefixed page access token key is still found" \
     "{\"$BOOL_FB_PAGE\":\"$BOOL_CURSOR\"}"
+fi
+
+# A lowercase UUID under a bare `key` field is a record identifier: recorded
+# API fixtures emit pretty-printed `"key": "<agent uuid>",` rows, and
+# generic-api-key read every one as a credential, blocking the commit. Only a
+# line holding that one pair is exempt. The UUID is fixed, not random, because
+# about 1 in 20 random UUIDs falls under the rule's entropy floor and would turn
+# every must-fail case below into a silent pass.
+if [ -n "$REAL_GITLEAKS" ]; then
+  UUIDK_DIR="$TESTTMP/uuid-key-gitleaks"
+  mkdir -p "$UUIDK_DIR"
+  UUIDK_HEX=$(printf '%s%s%s%s%s' 7b42a1e9 63dc 4f08 a295 1c8e6d03b574)
+  UUIDK_ID=$(printf '%s-%s-%s-%s-%s' 7b42a1e9 63dc 4f08 a295 1c8e6d03b574)
+  UUIDK_UPPER=$(printf '%s' "$UUIDK_ID" | tr 'a-f' 'A-F')
+  UUIDK_AK=$(printf '%s%s' api _key)
+  UUIDK_AKC=$(printf '%s%s' api Key)
+  UUIDK_SK=$(printf '%s%s' secret _key)
+  UUIDK_SLASH=$(printf '%s%s' api /key)
+  UUIDK_PRIV=$(printf '%s%s' 'private ' key)
+  uuidk_case() { # $1 expected status, $2 label, $3 file content
+    printf '%s\n' "$3" >"$UUIDK_DIR/fixtures.json"
+    PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" "$PLUGIN_ROOT/bin/agent-guard" \
+      scan-path "$UUIDK_DIR" >"$OUT" 2>"$ERR"
+    uuidk_status=$?
+    if [ "$uuidk_status" -eq "$1" ]; then
+      ok "real gitleaks: $2"
+    else
+      not_ok "real gitleaks: $2 (expected $1, got $uuidk_status)"
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  }
+  uuidk_case 0 "a UUID under a bare key field is clean (indented JSON)" \
+    "      \"key\": \"$UUIDK_ID\","
+  uuidk_case 0 "a UUID under a bare key field is clean (last member)" \
+    "      \"key\": \"$UUIDK_ID\""
+  uuidk_case 1 "a UUID under a bare key in compact JSON is still found" \
+    "{\"key\":\"$UUIDK_ID\",\"label\":\"agent\"}"
+  uuidk_case 0 "a UUID under a bare key field after another line is clean" \
+    "$(printf '    {\r\n      "key": "%s",\r\n      "label": "agent"\r' "$UUIDK_ID")"
+  uuidk_case 1 "a UUID on the line after a bare key is still found" \
+    "$(printf '{\n"key":\n"%s"\n}' "$UUIDK_ID")"
+  uuidk_case 1 "a UUID under a bare YAML key is still found" \
+    "key: $UUIDK_ID"
+  uuidk_case 1 "a UUID under a slash-joined api key name is still found" \
+    "      \"$UUIDK_SLASH\": \"$UUIDK_ID\","
+  uuidk_case 1 "a UUID under a spaced private key name is still found" \
+    "      \"$UUIDK_PRIV\": \"$UUIDK_ID\","
+  uuidk_case 1 "a UUID followed by a single quote and more text is still found" \
+    "      \"key\": \"$UUIDK_ID'live\","
+  uuidk_case 1 "a UUID followed by a backtick and more text is still found" \
+    "      \"key\": \"$UUIDK_ID\`live\","
+  uuidk_case 1 "an api key after a bare key UUID on one line is still found" \
+    "      \"key\": \"$UUIDK_ID\", \"$UUIDK_AK\": \"$UUIDK_ID\""
+  uuidk_case 1 "an api key before a bare key UUID on one line is still found" \
+    "      \"$UUIDK_AK\": \"$UUIDK_ID\", \"key\": \"$UUIDK_ID\""
+  uuidk_case 1 "a UUID under an api key field is still found" \
+    "{\"$UUIDK_AK\":\"$UUIDK_ID\"}"
+  uuidk_case 1 "a UUID under a camelCase api key field is still found" \
+    "{\"$UUIDK_AKC\":\"$UUIDK_ID\"}"
+  uuidk_case 1 "a UUID under a secret key field is still found" \
+    "{\"$UUIDK_SK\":\"$UUIDK_ID\"}"
+  uuidk_case 1 "a UUID assigned to a bare key with = is still found" \
+    "key=$UUIDK_ID"
+  uuidk_case 1 "an uppercase UUID under a bare key field is still found" \
+    "{\"key\":\"$UUIDK_UPPER\"}"
+  uuidk_case 1 "a UUID with trailing characters under a bare key is still found" \
+    "{\"key\":\"$UUIDK_ID$UUIDK_HEX\"}"
+  uuidk_case 1 "a non-UUID hex value under a bare key field is still found" \
+    "{\"key\":\"$UUIDK_HEX\"}"
+
+  # An Orca repository id (`--repo id:<uuid>`) after a word holding `key`.
+  UUIDK_MK=$(printf '%s%s' model- key)
+  uuidk_case 0 "a UUID under an id: label after a key word is clean" \
+    "skills-sync card /b/94S-1415-$UUIDK_MK.full.md --repo id:$UUIDK_ID --name x"
+  uuidk_case 0 "a quoted UUID under an id: label after a key word is clean" \
+    "$UUIDK_MK --repo 'id:$UUIDK_ID' --name x"
+  uuidk_case 1 "a UUID under a key word with a colon is still found" \
+    "$UUIDK_MK: $UUIDK_ID"
+  uuidk_case 1 "a UUID assigned to an upper-case key name is still found" \
+    "MODEL_KEY=$UUIDK_ID"
+  uuidk_case 1 "an uppercase UUID under an id: label is still found" \
+    "$UUIDK_MK --repo id:$UUIDK_UPPER"
+  uuidk_case 1 "an uppercase UUID with a trailing character under an id: label is still found" \
+    "$UUIDK_MK --repo id:${UUIDK_UPPER}X"
+  uuidk_case 1 "a UUID under an id: label outside --repo is still found" \
+    "Authorization: token id:$UUIDK_ID"
+  uuidk_case 1 "a UUID under an id: label after another option is still found" \
+    "$UUIDK_MK --name id:$UUIDK_ID"
+  uuidk_case 1 "a UUID with trailing characters under an id: label is still found" \
+    "$UUIDK_MK --repo id:${UUIDK_ID}abcd"
+  uuidk_case 1 "an api key after an id: UUID on one line is still found" \
+    "$UUIDK_MK --repo id:$UUIDK_ID $UUIDK_AK=$UUIDK_ID"
+
+  # The commit hook reads staged added lines through gitleaks stdin, not dir.
+  UUIDK_REPO="$TMP_ROOT/uuid-key-repo"
+  mkdir -p "$UUIDK_REPO"
+  (
+    cd "$UUIDK_REPO" || exit 2
+    git init -q
+    git config user.email t@e
+    git config user.name t
+    printf '{\n  "rows": [\n    {\n      "key": "%s",\n      "label": "agent"\n    }\n  ]\n}\n' \
+      "$UUIDK_ID" >fixtures.json
+    git add fixtures.json
+  )
+  (cd "$UUIDK_REPO" && PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged) >"$OUT" 2>"$ERR"
+  uuidk_status=$?
+  if [ "$uuidk_status" -eq 0 ]; then
+    ok "real gitleaks: scan-staged passes a staged UUID under a bare key field"
+  else
+    not_ok "real gitleaks: scan-staged passes a staged UUID under a bare key field (got $uuidk_status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
+  (
+    cd "$UUIDK_REPO" || exit 2
+    printf '%s\n' "{\"$UUIDK_AK\":\"$UUIDK_ID\"}" >config.json
+    git add config.json
+  )
+  (cd "$UUIDK_REPO" && PATH="$(dirname "$REAL_GITLEAKS"):$ORIGINAL_PATH" \
+    "$PLUGIN_ROOT/bin/agent-guard" scan-staged) >"$OUT" 2>"$ERR"
+  uuidk_status=$?
+  if [ "$uuidk_status" -eq 1 ]; then
+    ok "real gitleaks: scan-staged still blocks a staged UUID under an api key field"
+  else
+    not_ok "real gitleaks: scan-staged still blocks a staged UUID under an api key field (got $uuidk_status)"
+    sed 's/^/  stderr: /' "$ERR"
+  fi
 fi
 
 bool_case=0
@@ -12196,7 +12610,7 @@ for display_case in \
 done
 
 # Pure classification variants are table-driven in unit-status-label.sh.
-# Keep five CLI representatives here; see docs/status-label-tests.md for mapping.
+# Keep five CLI representatives here; see docs/development/status-label-tests.md for mapping.
 # #156: a status label alone must not buy a pass. The label is identical in
 # `error: password: authentication is disabled` (prose, covered above) and in
 # `error: password: <credential>`, so the VALUE decides. These values are the
@@ -12913,6 +13327,9 @@ for display_case in \
   fi
 done
 
+run_expect 0 "post-tool keeps type annotations, member references and fixture words in source text" \
+  sh "$ROOT/tests/source-text-redaction.sh"
+
 # Must-mask controls for the same gate. Narrowing the value side must not open a
 # hole: a bare literal still masks, a literal nested in an argument or subscript
 # list still masks (it is now reached on its own instead of by swallowing the
@@ -13627,7 +14044,7 @@ mkdir -p "$FAIL_WHOLE_JQ_DIR"
   printf '%s\n' 'if [ "${AGENT_GUARD_TEST_FAIL_RESTORE:-0}" = 1 ]; then'
   printf '%s\n' '  case "$*" in *'\''.[0] as $orig'\''*) printf "{\"partial\":"; exit 2 ;; esac'
   printf '%s\n' 'fi'
-  printf '%s\n' 'case "$*" in *'\''contains("\u0000")'\''*) exit 2 ;; esac'
+  printf '%s\n' 'case "$*" in *'\''(index("\u0000") != null)'\''*) exit 2 ;; esac'
   printf '%s\n' 'case " $* " in'
   printf '%s\n' '  *"length > 0"*)'
   printf '%s\n' '    if [ "${AGENT_GUARD_TEST_PARTIAL_PRIMARY:-0}" = 1 ]; then printf "{\"partial\":"; fi'
@@ -13648,7 +14065,7 @@ mkdir -p "$FAIL_STAGE_JQ_DIR"
   printf '%s\n' '  extract:*".tool_response // empty"*) partial_fail ;;'
   printf '%s\n' '  precise:*"def context_replace"*) partial_fail ;;'
   printf '%s\n' '  strip:*"strip_binary_payloads") partial_fail ;;'
-  printf '%s\n' '  nul:*'\''contains("\u0000")'\''*) partial_fail ;;'
+  printf '%s\n' '  nul:*'\''(index("\u0000") != null)'\''*) partial_fail ;;'
   printf '%s\n' '  restore:*'\''.[0] as $orig'\''*) partial_fail ;;'
   printf '%s\n' '  detector_leaf:*"join(\"\\n\") end"*) partial_fail ;;'
   printf '%s\n' '  detector_frame:*"\"\\u001e\\n\""*) partial_fail ;;'
@@ -14128,6 +14545,43 @@ else
   cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
   sed 's/^/  stderr: /' "$ERR"
 fi
+
+# Keep numeric fallback values and nested shapes independent of the optimized
+# scalar-record path. Quoted values still follow the original string transform.
+while IFS='|' read -r numeric_response numeric_expected; do
+  printf '%s' "$numeric_response" >"$fallback_numeric_response"
+  for numeric_host in claude codex; do
+    printf '%s' '{"tool_name":"Read","tool_input":{},"tool_response":[]}' \
+      | (cd "$TMP_ROOT" \
+          && PATH="$FAIL_WHOLE_JQ_DIR:$PATH" \
+             AGENT_GUARD_HOOK_HOST="$numeric_host" \
+             AGENT_GUARD_TEST_REAL_JQ="$REAL_JQ" \
+             AGENT_GUARD_TEST_RESPONSE_FILE="$fallback_numeric_response" \
+             "$PLUGIN_ROOT/bin/agent-guard" hook-post-tool) >"$OUT" 2>"$ERR"
+    numeric_status=$?
+    if [ "$numeric_status" -eq 0 ] \
+       && jq -e --arg host "$numeric_host" --argjson expected "$numeric_expected" '
+            if $host == "codex" then
+              .decision == "block" and
+              ((.hookSpecificOutput.additionalContext
+                | ltrimstr("Agent Guard sanitized tool output:\n") | fromjson) == $expected)
+            else .hookSpecificOutput.updatedToolOutput == $expected end
+          ' "$OUT" >/dev/null 2>&1; then
+      ok "portable fallback preserves independent numeric/shape expectation for $numeric_host: $numeric_response"
+    else
+      not_ok "portable fallback changes numeric/shape expectation for $numeric_host: $numeric_response"
+      cut -c1-400 "$OUT" | sed 's/^/  stdout: /'
+      sed 's/^/  stderr: /' "$ERR"
+    fi
+  done
+done <<'NUMERIC_FALLBACK_CASES'
+[12,-3,0,1.25,1e+50,true,false,null]|[0,0,0,0,0,false,false,null]
+[[1],[],{},[[true,null],-2.5e-6],3]|[[0],[],{},[[false,null],0],0]
+[true,{},[false],null,4]|[false,{},[false],null,0]
+12|0
+true|false
+{"items":[12,true,null],"type":"text","keep":""}|{"items":[0,false,null],"type":"text","keep":""}
+NUMERIC_FALLBACK_CASES
 
 # The large-response assignment probe consumes framed leaves. A sanitized value
 # must be checked after removing the transport boundary or `[REDACTED]` plus RS
@@ -14729,6 +15183,8 @@ else
 fi
 
 # --- agent-guard exec (shell-escape output masking) --------------------------
+run_expect 0 "plaintext framing preserves escaped records, byte boundaries and clean data" \
+  "$REAL_SH" "$ROOT/tests/plaintext-framing.sh"
 # `agent-guard exec` runs a command and masks secret-like values in its captured
 # output before printing. Secret VALUE assembled at runtime from fragments so this
 # file never holds a contiguous `token=...`-shaped literal upstream scanners flag.

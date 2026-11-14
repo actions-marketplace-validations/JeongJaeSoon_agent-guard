@@ -1,5 +1,7 @@
 # Verification
 
+English · [한국어](verification.ko.md) · [日本語](verification.ja.md)
+
 Use separate evidence for dependencies, deterministic behavior, and live host
 dispatch. A passing earlier layer does not prove a later one.
 
@@ -72,9 +74,18 @@ byte length with the placeholder's if you need to confirm it.
 
 ## Read results correctly
 
+- A successful JSON-tool exit does not always mean its serialized output is
+  complete. If intermediate PostToolUse output cannot be safely rewritten,
+  the guard attempts conservative recovery from the retained original event.
+  This preserves nested response shape when the independent parser succeeds;
+  it does not treat a failed scan as clean.
 - A detected secret is a block/finding, not a scanner error.
 - A `DEGRADED` message or unavailable scanner is not a clean scan. Repair the
   dependency or choose the documented infrastructure policy.
+  When available, `Scanner readiness: timeout.` identifies a bounded version
+  probe that timed out; other fixed readiness codes distinguish an unsupported
+  version or a failed probe. These diagnostics include no scanner output or
+  input paths. A timeout code identifies the failed stage, not why it was slow.
 - `open` infrastructure mode continues after a visible one-time warning;
   `closed` blocks. This policy applies to infrastructure failures, while a
   secret detection blocks. Non-empty malformed or non-object PreToolUse and
@@ -104,6 +115,36 @@ policy:
 Treat `2` and `3` as "not scanned", never as clean.
 
 ## Routine checks
+
+Performance experiments need separate accuracy and timing evidence. Compare the
+actual public release with the candidate using the same inputs, scanner,
+configuration and enforced resource limits, and verify every output against an
+independent expectation. Keep CLI startup, CPU, maximum individual child RSS,
+sampled process RSS sum and throughput distinct. A faster result caused by
+masking extra clean content or weakening a failure boundary is a failed
+experiment. Repeated successful checks after an intermittent failure do not
+establish its cause; retain the failed fixture, stdout and stderr when available.
+
+When the scanner itself is the experiment, identify that variable explicitly.
+Compare the official scanner, a rebuild with the original dependencies, and the
+candidate built with the same compiler and flags. Record binary hashes and
+dependency versions; an unchanged version string does not establish identical
+behavior. Test audit logging off and on, with both cold and warm readiness
+caches. A faster experimental scanner is not a supported installation until
+its detection, platform, update and recovery checks pass.
+
+Separate one-time installation costs from per-invocation costs. Report download
+and installed sizes, verification/unpacking, and source compilation separately;
+prebuilt helpers do not require a compiler on the user's machine. Compute a
+break-even invocation count only from comparable measurements of the actual
+workload. Peak memory cannot be amortized by repeated use. Lower latency and CPU
+can coexist with a higher sampled process RSS sum, so report that trade-off too.
+
+The fused output-pipeline candidate remains an explicit experiment, separate
+from the default installation path. A measured improvement does not establish
+release readiness: preserve compiler-free host setup, fallback behavior, and
+the host's existing timeout and locale contracts before adopting it.
+
 
 ```sh
 agent-guard doctor

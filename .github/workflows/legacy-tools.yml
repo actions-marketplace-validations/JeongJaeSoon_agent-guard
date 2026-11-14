@@ -1,0 +1,54 @@
+name: Legacy jq and awk contracts
+on:
+  pull_request:
+    paths:
+      - 'plugins/agent-guard/bin/agent-guard'
+      - 'tests/unit-nul-redaction.sh'
+      - 'tests/printenv-argument-contract.sh'
+      - 'tests/unit-audit-retention.sh'
+      - 'tests/post-tool-serialization-recovery.sh'
+      - '.github/workflows/legacy-tools.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'plugins/agent-guard/bin/agent-guard'
+      - 'tests/unit-nul-redaction.sh'
+      - 'tests/printenv-argument-contract.sh'
+      - 'tests/unit-audit-retention.sh'
+      - 'tests/post-tool-serialization-recovery.sh'
+      - '.github/workflows/legacy-tools.yml'
+  workflow_dispatch:
+# Replace only obsolete runs of the same PR. Non-PR runs have unique groups,
+# so main verification and manual checks cannot cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+jobs:
+  contracts:
+    name: Legacy jq and awk contracts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify legacy tool contracts
+        run: |
+          jq --version
+          test "$(jq --version)" = jq-1.6
+          /usr/bin/mawk -W version
+          sh tests/unit-nul-redaction.sh
+          sh tests/printenv-argument-contract.sh
+          AGENT_GUARD_TEST_AWK=/usr/bin/mawk sh tests/unit-audit-retention.sh
+          sh tests/post-tool-serialization-recovery.sh
+      - name: Verify jq 1.8.1 successful truncation recovery
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/jq-1.8.1"
+          curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64 -o "$RUNNER_TEMP/jq-1.8.1/jq"
+          printf '%s  %s\n' 020468de7539ce70ef1bceaf7cde2e8c4f2ca6c3afb84642aabc5c97d9fc2a0d "$RUNNER_TEMP/jq-1.8.1/jq" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/jq-1.8.1/jq"
+          AGENT_GUARD_TEST_JQ="$RUNNER_TEMP/jq-1.8.1/jq" sh tests/post-tool-serialization-recovery.sh

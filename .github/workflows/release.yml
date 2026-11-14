@@ -24,6 +24,7 @@ on:
         type: boolean
 
 permissions:
+  actions: read
   checks: read
   contents: write
   pull-requests: write
@@ -154,7 +155,7 @@ jobs:
               echo "release PR merged at $release_sha but origin/main is $main_sha; refusing to tag a later commit"
               exit 1
             fi
-            required_checks=$'Agent Guard\nTest (ubuntu-latest)\nTest (macos-latest)\nLint\nPlugin Layout\nHOL Plugin Scanner'
+            required_checks=$'Agent Guard\nTest (ubuntu-latest)\nTest (macos-latest)\nLint\nPlugin Layout\nHOL Plugin Scanner\nNative platform artifacts'
             release_head_checks=$(gh api \
               -H "Accept: application/vnd.github+json" \
               "repos/${GITHUB_REPOSITORY}/commits/${release_head_sha}/check-runs?filter=latest&per_page=100")
@@ -224,14 +225,53 @@ jobs:
             echo "skip_tag=false" >> "$GITHUB_OUTPUT"
           fi
 
-          # Does the release object already exist? If yes, assets will be
-          # uploaded with --clobber instead of attempting create.
+          # A published version is immutable for this workflow. Recovery must
+          # never silently replace previously distributed binaries/checksums.
           if gh release view "v${v}" >/dev/null 2>&1; then
-            echo "release_exists=true" >> "$GITHUB_OUTPUT"
-            echo "release v${v} already exists; will upload assets with --clobber"
-          else
-            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "release v${v} already exists; refusing to replace published assets"
+            exit 1
           fi
+
+      # Performance evidence warns and never blocks: before #415, runner noise
+      # around the 5% threshold blocked releases without a real regression.
+      # The release PR head and the release merge commit (verified to be
+      # origin/main) hold the exact tree this dispatch publishes; the latest
+      # run on either counts, so a dispatch on main can supply missing evidence.
+      - name: Report release performance evidence
+        if: steps.state.outputs.publish_ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_HEAD_SHA: ${{ steps.state.outputs.release_head_sha }}
+          RELEASE_SHA: ${{ steps.state.outputs.release_sha }}
+        run: |
+          set -uo pipefail
+          runs="$RUNNER_TEMP/performance-runs.json"
+          : > "$runs"
+          read_ok=true
+          for sha in "$RELEASE_HEAD_SHA" "$RELEASE_SHA"; do
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/performance.yml/runs?head_sha=${sha}&per_page=100" >> "$runs" \
+              || read_ok=false
+          done
+          subject="release head ${RELEASE_HEAD_SHA} or release commit ${RELEASE_SHA}"
+          if [ "$read_ok" != true ] \
+            || ! latest=$(jq -rs '[.[].workflow_runs[]] | sort_by(.id) | last
+                | if . == null then "missing" else "\(.status) \(.conclusion // "none") \(.html_url)" end' "$runs"); then
+            message="could not read Performance evidence runs for $subject"
+          else
+            read -r status conclusion url <<< "$latest"
+            if [ "$status" = missing ]; then
+              message="no Performance evidence run for $subject; run 'gh workflow run performance.yml --ref main' to measure it"
+            elif [ "$status" != completed ]; then
+              message="Performance evidence for $subject has not finished: $url"
+            elif [ "$conclusion" != success ]; then
+              message="Performance evidence for $subject concluded $conclusion: $url"
+            else
+              echo "Performance evidence passed for $subject: $url"
+              exit 0
+            fi
+          fi
+          echo "::warning title=Release performance evidence::$message"
+          printf '### Release performance evidence\n\n%s\n\nThis does not block the release.\n' "$message" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Bump version in tracked files
         if: steps.state.outputs.skip_pr_cycle != 'true'
@@ -342,7 +382,7 @@ jobs:
           else
             git push -u origin "$br"
           fi
-          printf -v body 'v%s 릴리스 준비 PR입니다.\n\nworkflow_dispatch 실행자: @%s\n이전 태그: %s\n버전 증가: %s\nDry run: %s\n\n이 PR은 자동 병합되지 않으며, 이 실행에서는 태그 생성이나 릴리스 발행도 수행하지 않습니다.\n\nGitHub Actions의 GITHUB_TOKEN으로 만든 PR은 일반 PR CI를 자동 기동하지 않습니다. 병합 전에 maintainer 개인 토큰으로 인증된 로컬 git/gh 세션에서 아래 명령으로 같은 브랜치에 빈 커밋을 push하세요(GITHUB_TOKEN 사용 금지).\n\n```sh\ngit fetch origin %s\ngit switch %s 2>/dev/null || git switch --track origin/%s\ngit pull --ff-only origin %s\ngit commit --allow-empty -m "ci: trigger release verification"\ngit push origin %s\n```\n\n다음 필수 checks가 모두 SUCCESS인지 확인한 뒤 사람이 병합하세요: Agent Guard, Test (ubuntu-latest), Test (macos-latest), Lint, Plugin Layout, HOL Plugin Scanner.\n\n병합 후 version에 %s를 명시하여 release workflow를 다시 실행하면 origin/main의 버전, 병합 PR의 exact head SHA에 연결된 필수 checks, 병합 commit을 검증한 뒤 태그와 릴리스를 발행합니다.\n' \
+          printf -v body 'v%s 릴리스 준비 PR입니다.\n\nworkflow_dispatch 실행자: @%s\n이전 태그: %s\n버전 증가: %s\nDry run: %s\n\n이 PR은 자동 병합되지 않으며, 이 실행에서는 태그 생성이나 릴리스 발행도 수행하지 않습니다.\n\nGitHub Actions의 GITHUB_TOKEN으로 만든 PR은 일반 PR CI를 자동 기동하지 않습니다. 병합 전에 maintainer 개인 토큰으로 인증된 로컬 git/gh 세션에서 아래 명령으로 같은 브랜치에 빈 커밋을 push하세요(GITHUB_TOKEN 사용 금지).\n\n```sh\ngit fetch origin %s\ngit switch %s 2>/dev/null || git switch --track origin/%s\ngit pull --ff-only origin %s\ngit commit --allow-empty -m "ci: trigger release verification"\ngit push origin %s\n```\n\n다음 필수 checks가 모두 SUCCESS인지 확인한 뒤 사람이 병합하세요: Agent Guard, Test (ubuntu-latest), Test (macos-latest), Lint, Plugin Layout, HOL Plugin Scanner.\n\n같은 push로 Performance evidence 워크플로도 이 PR head를 측정합니다. 릴리스를 막지는 않지만 병합 전에 결과를 확인하세요. 발행 dispatch도 결과를 경고로 남깁니다.\n\n병합 후 version에 %s를 명시하여 release workflow를 다시 실행하면 origin/main의 버전, 병합 PR의 exact head SHA에 연결된 필수 checks, 병합 commit을 검증한 뒤 태그와 릴리스를 발행합니다.\n' \
             "$v" \
             "${{ github.actor }}" \
             "$PREVIOUS_VERSION" \
@@ -407,6 +447,32 @@ jobs:
           done
           scripts/validate-plugin-layout.sh --marketplace
 
+          # Publish the reviewed version entry, including its limitations.
+          # Validate it before creating any tag or release asset.
+          release_notes="$RUNNER_TEMP/release-notes.md"
+          awk -v version="v${v}" '
+            /^## / {
+              if (found) exit
+              if ($2 == version) found = 1
+              next
+            }
+            found { print; if (NF) body = 1 }
+            END { if (!found || !body) exit 1 }
+          ' CHANGELOG.md > "$release_notes"
+
+          # Qualify and assemble everything before creating any version tag.
+          # These artifacts were executed on all four native platforms at this
+          # exact main SHA; a cross-build or another commit is not accepted.
+          native_release_dir="$RUNNER_TEMP/qualified-native"
+          sh scripts/prepare-native-release.sh "$head_sha" "$native_release_dir"
+          tarball_tmp=$(mktemp -d)/agent-guard-${v}.tar.gz
+          AGENT_GUARD_NATIVE_ARTIFACT_DIR="$native_release_dir" \
+            scripts/build-release-tarball.sh "$v" "$tarball_tmp"
+          mv "$tarball_tmp" "agent-guard-${v}.tar.gz"
+          sha256sum "agent-guard-${v}.tar.gz" > "agent-guard-${v}.tar.gz.sha256"
+          tarball_sha=$(awk '{print $1}' "agent-guard-${v}.tar.gz.sha256")
+          scripts/render-homebrew-formula.sh "$v" "$tarball_sha" > agent-guard.rb
+
           # Releasing a new major line must not move an older major's compatibility
           # tag. Capture v1 before publishing v2+ and prove it is unchanged after
           # the new moving tag is pushed.
@@ -446,45 +512,19 @@ jobs:
             echo "verified legacy moving tag v1 remains at $legacy_v1_after"
           fi
 
-          # Build the tarball outside the directory tar is enumerating to
-          # avoid the "file changed as we read it" race documented for runs
-          # 25510030204 (v1.1.0) and 25511359582 (v1.1.1) -- writing to a temp
-          # dir and mv'ing the finished tarball back is bulletproof.
-          #
-          # Tarball root is plugins/agent-guard/ so the bootstrap-extracted
-          # layout (~/.agent-guard/bin/agent-guard) stays unchanged for
-          # existing Direct-CLI users across major-version updates.
-          tarball_tmp=$(mktemp -d)/agent-guard-${v}.tar.gz
-          scripts/build-release-tarball.sh "$v" "$tarball_tmp"
-          mv "$tarball_tmp" "agent-guard-${v}.tar.gz"
-          sha256sum "agent-guard-${v}.tar.gz" > "agent-guard-${v}.tar.gz.sha256"
-          tarball_sha=$(awk '{print $1}' "agent-guard-${v}.tar.gz.sha256")
-          scripts/render-homebrew-formula.sh "$v" "$tarball_sha" > agent-guard.rb
-
-          # Idempotent release publish: if a release object already exists
-          # (recovery path from a previous half-finished dispatch), upload the
-          # assets with --clobber so any stale assets are replaced. Otherwise
-          # create the release fresh with auto-generated notes. Recheck the
-          # state here rather than reusing Detect's output so we don't race a
-          # release object that was created between the two steps.
+          # Recheck for a concurrent publication; never overwrite public assets.
           if gh release view "v${v}" >/dev/null 2>&1; then
-            gh release upload "v${v}" \
-              "agent-guard-${v}.tar.gz" \
-              "agent-guard-${v}.tar.gz.sha256" \
-              agent-guard.rb \
-              install.sh \
-              bootstrap.sh \
-              --clobber
-          else
-            gh release create "v${v}" \
-              --title "Agent Guard v${v}" \
-              --generate-notes \
-              "agent-guard-${v}.tar.gz" \
-              "agent-guard-${v}.tar.gz.sha256" \
-              agent-guard.rb \
-              install.sh \
-              bootstrap.sh
+            echo "release v${v} now exists; refusing to replace published assets"
+            exit 1
           fi
+          gh release create "v${v}" \
+            --title "Agent Guard v${v}" \
+            --notes-file "$release_notes" \
+            "agent-guard-${v}.tar.gz" \
+            "agent-guard-${v}.tar.gz.sha256" \
+            agent-guard.rb install.sh bootstrap.sh THIRD_PARTY_NOTICES.md \
+            "$native_release_dir"/agent-guard-redact-* \
+            "$native_release_dir/native-validation.json"
 
       # The tap lives in another repository, so GITHUB_TOKEN cannot write to
       # it. The release is already public when this runs; a failure here leaves
